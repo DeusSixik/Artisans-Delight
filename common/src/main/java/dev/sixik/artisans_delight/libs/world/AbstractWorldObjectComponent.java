@@ -12,6 +12,10 @@ import java.util.function.Supplier;
  * <p>State convention: guard mutable fields with {@link #withRead}/{@link #runWrite}
  * (or the exposed {@link #readLock}/{@link #writeLock} directly). Ownership is managed
  * by {@link WorldObject} only; the {@code bind} method is package-private on purpose.
+ *
+ * <p>Direct subclasses are rare: prefer {@code SyncedWorldObjectComponent} for shared
+ * multithreaded state or {@link SingleThreadedWorldObjectComponent} for plain
+ * single-threaded logic (it deliberately ignores these locks).
  */
 public abstract class AbstractWorldObjectComponent implements WorldObjectComponent {
 

@@ -5,31 +5,22 @@ import java.util.concurrent.locks.StampedLock;
 import java.util.function.UnaryOperator;
 
 /**
- * A single named value guarded by a {@link StampedLock}, with a monotonic revision
- * and codec-based snapshot comparison.
+ * A {@link Field} guarded by a {@link StampedLock}, with a monotonic revision.
  *
- * <p>Threading: optimistic reads for {@link #get}, exclusive writes for {@link #set}
- * and friends. Every write performs compare-and-copy under the write stamp: the new
- * value is compared against the live value, not against a stale snapshot, so a
- * concurrent write can never be silently dropped by a lost-update race. The revision
- * increments only when the value actually changes (by {@link FieldCodec#areEqual});
- * setting an equal value leaves {@link #revision} untouched, which is what keeps
- * network deltas quiet.
- *
- * <p>Values must be effectively immutable to readers: {@link #get} returns the live
- * reference without copying. For mutable value types use {@link #update} with a
- * copy-on-write function, or a codec whose {@link FieldCodec#copy} deep-copies and
- * rely on {@link #set}/{@link #update} to install the replacement.
+ * <p>Поле для многопоточных компонентов ({@code SyncedWorldObjectComponent}):
+ * optimistic reads для {@link #get}, эксклюзивные writes для {@link #set}.
+ * Каждая запись сравнивает новое значение с живым под write-stamp, поэтому
+ * гонящиеся писатели сериализуются и ни одно обновление не теряется. Ревизия
+ * растёт только на реальном изменении (по {@link FieldCodec#areEqual});
+ * установка равного значения ревизию не трогает — это и держит сетевые
+ * дельты тихими.
  *
  * @param <Value> field value type
  */
-public final class TrackedField<Value> {
+public final class TrackedField<Value> extends Field<Value> {
 
-    private final String name;
-    private final FieldCodec<Value> codec;
     private final StampedLock lock = new StampedLock();
 
-    private volatile Value value;
     private volatile long revision;
 
     /**
@@ -38,39 +29,21 @@ public final class TrackedField<Value> {
      * leak into the field.
      */
     public TrackedField(String name, FieldCodec<Value> codec, Value defaultValue) {
-        this.name = Objects.requireNonNull(name, "name");
-        this.codec = Objects.requireNonNull(codec, "codec");
-        if (name.isBlank()) {
-            throw new IllegalArgumentException("name must not be blank");
-        }
-        this.value = codec.copy(defaultValue);
+        super(name, codec, defaultValue);
         this.revision = 0L;
-    }
-
-    /**
-     * Field name, stable across restarts. Used as the NBT key and delta id.
-     */
-    public String name() {
-        return name;
-    }
-
-    /**
-     * Codec used for NBT, network and equality.
-     */
-    public FieldCodec<Value> codec() {
-        return codec;
     }
 
     /**
      * Returns the live value (no copy). Optimistic read, never blocks writers.
      */
+    @Override
     public Value get() {
         long stamp = lock.tryOptimisticRead();
-        Value current = value;
+        Value current = super.get();
         if (!lock.validate(stamp)) {
             stamp = lock.readLock();
             try {
-                current = value;
+                current = super.get();
             } finally {
                 lock.unlockRead(stamp);
             }
@@ -91,16 +64,16 @@ public final class TrackedField<Value> {
      * writers serialize and no update is lost: each writer compares its own
      * argument to whatever is current at its turn.
      */
+    @Override
     public boolean set(Value newValue) {
         long stamp = lock.writeLock();
         try {
-            Value current = value;
-            if (codec.areEqual(current, newValue)) {
-                return false;
+            long before = revision;
+            boolean changed = super.set(newValue);
+            if (changed) {
+                revision = before + 1;
             }
-            value = codec.copy(newValue);
-            revision++;
-            return true;
+            return changed;
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -111,18 +84,17 @@ public final class TrackedField<Value> {
      * runs under the write stamp against the live value, so read-modify-write
      * sequences (counters, appends) cannot interleave. Returns {@code true} on change.
      */
+    @Override
     public boolean update(UnaryOperator<Value> remap) {
         Objects.requireNonNull(remap, "remap");
         long stamp = lock.writeLock();
         try {
-            Value current = value;
-            Value next = remap.apply(codec.copy(current));
-            if (codec.areEqual(current, next)) {
-                return false;
+            long before = revision;
+            boolean changed = super.update(remap);
+            if (changed) {
+                revision = before + 1;
             }
-            value = codec.copy(next);
-            revision++;
-            return true;
+            return changed;
         } finally {
             lock.unlockWrite(stamp);
         }
@@ -139,7 +111,7 @@ public final class TrackedField<Value> {
             if (revision <= knownRevision) {
                 return null;
             }
-            return codec.copy(value);
+            return codec().copy(get());
         } finally {
             lock.unlockRead(stamp);
         }
@@ -148,17 +120,18 @@ public final class TrackedField<Value> {
     /**
      * Compares the live value against {@code snapshot} with codec equality.
      */
+    @Override
     public boolean isEqualTo(Value snapshot) {
         long stamp = lock.tryOptimisticRead();
-        Value current = value;
+        Value current = super.get();
         if (!lock.validate(stamp)) {
             stamp = lock.readLock();
             try {
-                current = value;
+                current = super.get();
             } finally {
                 lock.unlockRead(stamp);
             }
         }
-        return codec.areEqual(current, snapshot);
+        return codec().areEqual(current, snapshot);
     }
 }

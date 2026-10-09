@@ -1,22 +1,24 @@
 package dev.sixik.artisans_delight.libs.world.sync;
 
-import dev.sixik.artisans_delight.libs.world.AbstractWorldObjectComponent;
+import dev.sixik.artisans_delight.libs.world.FieldedWorldObjectComponent;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
 
 /**
  * Component base with declarative {@link TrackedField}s, full-state NBT persistence
  * and revision-based network deltas.
  *
- * <p>Usage: declare fields, register them in the constructor via {@link #field},
- * then mutate through the returned {@link TrackedField} handles. Field order is
- * declaration order and is part of the network schema: {@link #writeFull} writes
- * values in that order, {@link #readFull} reads them back positionally.
+ * <p>Usage: declare fields via {@link #tracked} (inherited from
+ * {@code FieldedWorldObjectComponent}), then mutate through the returned handles.
+ * Only {@link TrackedField} instances participate in the network schema; a plain
+ * {@link Field} declared via {@code field()} is NBT-only and never touches the wire.
+ * Field order is declaration order and is part of the network schema:
+ * {@link #writeFull} writes values in that order, {@link #readFull} reads them back
+ * positionally. NBT persistence ({@link #writeNbt}/{@link #readNbt}) comes from
+ * {@code FieldedWorldObjectComponent} and is key-based and tolerant: missing keys
+ * keep current values.
  *
  * <p>Threading: fields are individually lock-striped ({@link StampedLock} each),
  * so concurrent writes to different fields never contend. Delta collection takes
@@ -37,42 +39,24 @@ import net.minecraft.network.FriendlyByteBuf;
  * decoding garbage. NBT persistence ({@link #writeNbt}/{@link #readNbt}) is
  * key-based and tolerant: missing keys keep current values.
  */
-public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComponent {
-
-    private final List<TrackedField<?>> fields = new ArrayList<>();
-    private final Map<String, TrackedField<?>> byName = new LinkedHashMap<>();
+public abstract class SyncedWorldObjectComponent extends FieldedWorldObjectComponent {
 
     /**
-     * Declares a field. Must be called from the constructor, before attach.
-     * Duplicate names are rejected.
+     * Networked fields: every declared {@link TrackedField} in declaration order.
+     * A plain {@link Field} (NBT-only) here is a schema error — network positions
+     * must be dense, so it fails fast with {@link SyncException}.
      */
-    protected final <Value> TrackedField<Value> field(String name, FieldCodec<Value> codec, Value defaultValue) {
-        Objects.requireNonNull(name, "name");
-        Objects.requireNonNull(codec, "codec");
-        TrackedField<Value> tracked = new TrackedField<>(name, codec, defaultValue);
-        if (byName.putIfAbsent(name, tracked) != null) {
-            throw new IllegalArgumentException("Duplicate field '" + name + "' in " + getClass().getName());
+    private List<TrackedField<?>> networkFields() {
+        List<Field<?>> all = syncedFields();
+        List<TrackedField<?>> networked = new ArrayList<>(all.size());
+        for (Field<?> field : all) {
+            if (!(field instanceof TrackedField<?> tracked)) {
+                throw new SyncException("Field '" + field.name() + "' in " + getClass().getName()
+                        + " is NBT-only: declare networked fields via tracked(), not field()");
+            }
+            networked.add(tracked);
         }
-        fields.add(tracked);
-        return tracked;
-    }
-
-    /**
-     * Declared fields in declaration order. The returned list is a copy.
-     */
-    public final List<TrackedField<?>> syncedFields() {
-        return List.copyOf(fields);
-    }
-
-    /**
-     * Looks up a field by name.
-     */
-    public final TrackedField<?> fieldByName(String name) {
-        TrackedField<?> tracked = byName.get(name);
-        if (tracked == null) {
-            throw new IllegalArgumentException("Unknown field '" + name + "' in " + getClass().getName());
-        }
-        return tracked;
+        return networked;
     }
 
     /**
@@ -80,6 +64,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      * every delta in dev builds) and refuse deltas on mismatch.
      */
     public final long schemaFingerprint() {
+        List<TrackedField<?>> fields = networkFields();
         long hash = 0x9E3779B97F4A7C15L;
         for (TrackedField<?> tracked : fields) {
             hash = mix(hash, tracked.name());
@@ -93,6 +78,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      * Writes every field value in declaration order (no field names on the wire).
      */
     public final void writeFull(FriendlyByteBuf buf) {
+        List<TrackedField<?>> fields = networkFields();
         writeRevisions(buf);
         for (TrackedField<?> tracked : fields) {
             writeValue(buf, tracked);
@@ -105,6 +91,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      * always carries all), so any short read throws from the buffer itself.
      */
     public final void readFull(FriendlyByteBuf buf) {
+        List<TrackedField<?>> fields = networkFields();
         long[] revisions = readRevisions(buf);
         for (int i = 0; i < fields.size(); i++) {
             readValue(buf, fields.get(i));
@@ -116,6 +103,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      * Feed them into {@link DeltaTracker#reset} on the receiving side.
      */
     public final long[] readFullWithRevisions(FriendlyByteBuf buf) {
+        List<TrackedField<?>> fields = networkFields();
         long[] revisions = readRevisions(buf);
         for (TrackedField<?> tracked : fields) {
             readValue(buf, tracked);
@@ -132,6 +120,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      */
     public final boolean writeDelta(FriendlyByteBuf buf, DeltaTracker tracker) {
         Objects.requireNonNull(tracker, "tracker");
+        List<TrackedField<?>> fields = networkFields();
         tracker.ensureCapacity(fields.size());
         List<Integer> touched = null;
         for (int i = 0; i < fields.size(); i++) {
@@ -166,6 +155,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
      */
     public final void readDelta(FriendlyByteBuf buf, DeltaTracker tracker) {
         Objects.requireNonNull(tracker, "tracker");
+        List<TrackedField<?>> fields = networkFields();
         tracker.ensureCapacity(fields.size());
         int count = buf.readVarInt();
         if (count < 0 || count > fields.size() * 2) {
@@ -188,26 +178,8 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
         }
     }
 
-    /**
-     * Writes all fields into {@code nbt} under their names.
-     */
-    public final void writeNbt(CompoundTag nbt) {
-        Objects.requireNonNull(nbt, "nbt");
-        for (TrackedField<?> tracked : fields) {
-            writeNbtValue(nbt, tracked);
-        }
-    }
-
-    /**
-     * Reads fields from {@code nbt} by name. Missing keys keep current values,
-     * which makes saves forward-compatible with newly added fields.
-     */
-    public final void readNbt(CompoundTag nbt) {
-        Objects.requireNonNull(nbt, "nbt");
-        for (TrackedField<?> tracked : fields) {
-            readNbtValue(nbt, tracked);
-        }
-    }
+    // NBT persistence is inherited from FieldedWorldObjectComponent (key-based,
+    // tolerant to missing keys). Network helpers below.
 
     /**
      * Per-viewer revision bookkeeping for {@link #writeDelta}/{@link #readDelta}.
@@ -286,6 +258,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
     }
 
     private long[] currentRevisions() {
+        List<TrackedField<?>> fields = networkFields();
         long[] revisions = new long[fields.size()];
         for (int i = 0; i < fields.size(); i++) {
             revisions[i] = fields.get(i).revision();
@@ -294,6 +267,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
     }
 
     private void writeRevisions(FriendlyByteBuf buf) {
+        List<TrackedField<?>> fields = networkFields();
         buf.writeVarInt(fields.size());
         for (TrackedField<?> tracked : fields) {
             buf.writeVarLong(tracked.revision());
@@ -301,6 +275,7 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
     }
 
     private long[] readRevisions(FriendlyByteBuf buf) {
+        List<TrackedField<?>> fields = networkFields();
         int size = buf.readVarInt();
         if (size != fields.size()) {
             throw new SyncException("Full sync field count mismatch: got " + size
@@ -346,21 +321,5 @@ public abstract class SyncedWorldObjectComponent extends AbstractWorldObjectComp
 
     private static <Value> void skipValueCaptured(FriendlyByteBuf buf, TrackedField<Value> tracked) {
         tracked.codec().fromNetwork(buf);
-    }
-
-    private static void writeNbtValue(CompoundTag nbt, TrackedField<?> tracked) {
-        writeNbtValueCaptured(nbt, tracked);
-    }
-
-    private static <Value> void writeNbtValueCaptured(CompoundTag nbt, TrackedField<Value> tracked) {
-        tracked.codec().toNbt(nbt, tracked.name(), tracked.get());
-    }
-
-    private static void readNbtValue(CompoundTag nbt, TrackedField<?> tracked) {
-        readNbtValueCaptured(nbt, tracked);
-    }
-
-    private static <Value> void readNbtValueCaptured(CompoundTag nbt, TrackedField<Value> tracked) {
-        tracked.set(tracked.codec().fromNbt(nbt, tracked.name(), tracked.get()));
     }
 }

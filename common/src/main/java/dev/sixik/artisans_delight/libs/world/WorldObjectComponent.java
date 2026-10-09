@@ -5,9 +5,10 @@ import java.util.Optional;
 /**
  * Single unit of data or behaviour attached to a {@link WorldObject}.
  *
- * <p>Implementations must be thread-safe: {@code onTick} and any public mutators may run
- * on ticker threads while other threads read. Extend {@link AbstractWorldObjectComponent}
- * to inherit a ready-made read/write lock and ownership bookkeeping.
+ * <p>Two ready-made bases cover both models: {@code SyncedWorldObjectComponent}
+ * for shared multithreaded state with NBT persistence and network deltas, and
+ * {@link SingleThreadedWorldObjectComponent} for plain single-threaded logic
+ * with direct NBT persistence and no locking overhead.
  *
  * <p>Lifecycle contract: {@link #onAttached} runs before the component becomes visible
  * to readers and must not mutate the owner synchronously; use {@link WorldObject#defer}
