@@ -1,6 +1,8 @@
 package dev.sixik.artisans_delight.libs.world;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,6 +12,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * Owns every {@link WorldObject} of a world (or dimension): creates, ticks and
@@ -87,10 +90,31 @@ public final class WorldObjectManager implements AutoCloseable {
     }
 
     /**
-     * Point-in-time copy of all registered objects.
+     * Live view of all registered objects. No copy, no allocation: backed directly
+     * by the registry. The view is weakly consistent — safe to iterate while other
+     * threads add or remove objects — but never mutate through it. Need a stable
+     * point-in-time copy (e.g. to sort or retain)? Use {@link #snapshot()}.
      */
-    public List<WorldObject> all() {
+    public Collection<WorldObject> all() {
+        return Collections.unmodifiableCollection(objects.values());
+    }
+
+    /**
+     * Point-in-time copy of all registered objects. Allocates; prefer {@link #all()}
+     * or {@link #forEach} for plain iteration.
+     */
+    public List<WorldObject> snapshot() {
         return new ArrayList<>(objects.values());
+    }
+
+    /**
+     * Applies {@code action} to every registered object. Zero-allocation iteration
+     * over the live registry; a per-object failure does not stop the rest —
+     * use {@link #tickAll} when failures must be aggregated and rethrown.
+     */
+    public void forEach(Consumer<WorldObject> action) {
+        Objects.requireNonNull(action, "action");
+        objects.values().forEach(action);
     }
 
     /**

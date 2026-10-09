@@ -2,7 +2,9 @@ package dev.sixik.artisans_delight.libs.world;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -62,8 +64,7 @@ public final class WorldObject {
     private final ConcurrentLinkedQueue<Runnable> deferred = new ConcurrentLinkedQueue<>();
     private final AtomicLong sequencer = new AtomicLong();
 
-    private volatile List<ComponentEntry> snapshot = List.of();
-    private volatile boolean detached;
+    private volatile View view = View.EMPTY;
 
     public WorldObject() {
         this(UUID.randomUUID());
@@ -84,7 +85,7 @@ public final class WorldObject {
      * Current lifecycle: a live object accepts mutations until {@link #detach}.
      */
     public boolean isDetached() {
-        return detached;
+        return view.detached;
     }
 
     /**
@@ -96,12 +97,11 @@ public final class WorldObject {
         List<ComponentEntry> removed;
         writeLock.lock();
         try {
-            if (detached) {
+            if (view.detached) {
                 return false;
             }
-            detached = true;
-            removed = snapshot;
-            snapshot = List.of();
+            removed = view.entries;
+            view = View.EMPTY.detached();
             deferred.clear();
             for (ComponentEntry entry : removed) {
                 asAbstract(entry.component()).bind(null);
@@ -150,13 +150,7 @@ public final class WorldObject {
             }
             replaced = List.of();
             if (type != null) {
-                List<ComponentEntry> view = snapshot;
-                List<ComponentEntry> clashing = new ArrayList<>();
-                for (ComponentEntry entry : view) {
-                    if (matches(entry, type)) {
-                        clashing.add(entry);
-                    }
-                }
+                List<ComponentEntry> clashing = view.byType.getOrDefault(type, List.of());
                 if (!clashing.isEmpty()) {
                     switch (type.duplicatePolicy()) {
                         case REJECT -> throw new DuplicateComponentException(
@@ -167,7 +161,7 @@ public final class WorldObject {
                     }
                 }
             }
-            List<ComponentEntry> next = new ArrayList<>(snapshot);
+            List<ComponentEntry> next = new ArrayList<>(view.entries);
             next.removeAll(replaced);
             handle.bind(this);
             for (ComponentEntry entry : replaced) {
@@ -175,7 +169,7 @@ public final class WorldObject {
             }
             next.add(new ComponentEntry(component, type, sequencer.getAndIncrement()));
             next.sort(ORDER);
-            snapshot = List.copyOf(next);
+            view = View.of(next);
         } finally {
             writeLock.unlock();
         }
@@ -210,11 +204,11 @@ public final class WorldObject {
         ComponentEntry target;
         writeLock.lock();
         try {
-            if (detached) {
+            if (view.detached) {
                 return false;
             }
             target = null;
-            for (ComponentEntry entry : snapshot) {
+            for (ComponentEntry entry : view.entries) {
                 if (entry.component() == component) {
                     target = entry;
                     break;
@@ -223,9 +217,9 @@ public final class WorldObject {
             if (target == null) {
                 return false;
             }
-            List<ComponentEntry> next = new ArrayList<>(snapshot);
+            List<ComponentEntry> next = new ArrayList<>(view.entries);
             next.remove(target);
-            snapshot = List.copyOf(next);
+            view = View.of(next);
             asAbstract(component).bind(null);
         } finally {
             writeLock.unlock();
@@ -265,12 +259,12 @@ public final class WorldObject {
         List<ComponentEntry> removed;
         writeLock.lock();
         try {
-            if (detached) {
+            if (view.detached) {
                 return List.of();
             }
             removed = new ArrayList<>();
             List<ComponentEntry> next = new ArrayList<>();
-            for (ComponentEntry entry : snapshot) {
+            for (ComponentEntry entry : view.entries) {
                 if (filter.test(entry)) {
                     removed.add(entry);
                 } else {
@@ -280,7 +274,7 @@ public final class WorldObject {
             if (removed.isEmpty()) {
                 return List.of();
             }
-            snapshot = List.copyOf(next);
+            view = View.of(next);
             for (ComponentEntry entry : removed) {
                 asAbstract(entry.component()).bind(null);
             }
@@ -303,22 +297,24 @@ public final class WorldObject {
         return List.copyOf(result);
     }
 
-    // Lock-free reads.
+    // Lock-free reads. Lookups by type/class resolve through the per-snapshot
+    // index; polymorphic class queries still scan the entries linearly, which is
+    // a single cache line for the expected handful of components per object.
 
     /**
      * Immutable snapshot of entries (component plus its attach type). Never blocks.
      */
     public List<ComponentEntry> entries() {
-        return snapshot;
+        return view.entries;
     }
 
     /**
      * Immutable snapshot of components in tick order. Never blocks.
      */
     public List<WorldObjectComponent> components() {
-        List<ComponentEntry> view = snapshot;
-        List<WorldObjectComponent> result = new ArrayList<>(view.size());
-        for (ComponentEntry entry : view) {
+        List<ComponentEntry> entries = view.entries;
+        List<WorldObjectComponent> result = new ArrayList<>(entries.size());
+        for (ComponentEntry entry : entries) {
             result.add(entry.component());
         }
         return List.copyOf(result);
@@ -329,8 +325,9 @@ public final class WorldObject {
      */
     public <C extends WorldObjectComponent> List<C> get(Class<C> componentClass) {
         Objects.requireNonNull(componentClass, "componentClass");
+        List<ComponentEntry> entries = view.entries;
         List<C> result = new ArrayList<>();
-        for (ComponentEntry entry : snapshot) {
+        for (ComponentEntry entry : entries) {
             if (componentClass.isInstance(entry.component())) {
                 result.add(componentClass.cast(entry.component()));
             }
@@ -343,7 +340,7 @@ public final class WorldObject {
      */
     public <C extends WorldObjectComponent> Optional<C> getSingle(Class<C> componentClass) {
         Objects.requireNonNull(componentClass, "componentClass");
-        for (ComponentEntry entry : snapshot) {
+        for (ComponentEntry entry : view.entries) {
             if (componentClass.isInstance(entry.component())) {
                 return Optional.of(componentClass.cast(entry.component()));
             }
@@ -352,30 +349,28 @@ public final class WorldObject {
     }
 
     /**
-     * All components attached under {@code type}, in tick order.
+     * All components attached under {@code type}, in tick order. O(1) index lookup.
      */
     public <C extends WorldObjectComponent> List<C> get(WorldObjectComponentType<C> type) {
         Objects.requireNonNull(type, "type");
-        List<C> result = new ArrayList<>();
-        for (ComponentEntry entry : snapshot) {
-            if (matches(entry, type)) {
-                result.add(type.componentClass().cast(entry.component()));
-            }
+        List<ComponentEntry> entries = view.byType.getOrDefault(type, List.of());
+        List<C> result = new ArrayList<>(entries.size());
+        for (ComponentEntry entry : entries) {
+            result.add(type.componentClass().cast(entry.component()));
         }
         return List.copyOf(result);
     }
 
     /**
-     * First component attached under {@code type}, if any.
+     * First component attached under {@code type}, if any. O(1) index lookup.
      */
     public <C extends WorldObjectComponent> Optional<C> getSingle(WorldObjectComponentType<C> type) {
         Objects.requireNonNull(type, "type");
-        for (ComponentEntry entry : snapshot) {
-            if (matches(entry, type)) {
-                return Optional.of(type.componentClass().cast(entry.component()));
-            }
+        List<ComponentEntry> entries = view.byType.getOrDefault(type, List.of());
+        if (entries.isEmpty()) {
+            return Optional.empty();
         }
-        return Optional.empty();
+        return Optional.of(type.componentClass().cast(entries.get(0).component()));
     }
 
     /**
@@ -386,23 +381,18 @@ public final class WorldObject {
     }
 
     /**
-     * Returns {@code true} if any component is attached under {@code type}.
+     * Returns {@code true} if any component is attached under {@code type}. O(1).
      */
     public boolean has(WorldObjectComponentType<?> type) {
         Objects.requireNonNull(type, "type");
-        for (ComponentEntry entry : snapshot) {
-            if (matches(entry, type)) {
-                return true;
-            }
-        }
-        return false;
+        return view.byType.containsKey(type);
     }
 
     /**
      * Number of attached components.
      */
     public int size() {
-        return snapshot.size();
+        return view.entries.size();
     }
 
     /**
@@ -412,14 +402,14 @@ public final class WorldObject {
         boolean changed;
         writeLock.lock();
         try {
-            if (detached) {
+            if (view.detached) {
                 return false;
             }
-            List<ComponentEntry> next = new ArrayList<>(snapshot);
+            List<ComponentEntry> next = new ArrayList<>(view.entries);
             next.sort(ORDER);
-            changed = !orderEquals(next, snapshot);
+            changed = !orderEquals(next, view.entries);
             if (changed) {
-                snapshot = List.copyOf(next);
+                view = View.of(next);
             }
         } finally {
             writeLock.unlock();
@@ -441,15 +431,18 @@ public final class WorldObject {
      * listeners and aggregated into {@link TickException}. Deferred tasks run after.
      */
     public void tick(long tick) {
-        if (detached) {
+        if (view.detached) {
             return;
         }
-        List<Throwable> failures = new ArrayList<>();
-        for (ComponentEntry entry : snapshot) {
+        List<Throwable> failures = null;
+        for (ComponentEntry entry : view.entries) {
             if (entry.component() instanceof TickableComponent tickable) {
                 try {
                     tickable.onTick(tick);
                 } catch (Throwable failure) {
+                    if (failures == null) {
+                        failures = new ArrayList<>();
+                    }
                     failures.add(failure);
                     fireError(entry.component(), failure);
                 }
@@ -458,9 +451,12 @@ public final class WorldObject {
         try {
             drainDeferred();
         } catch (WorldObjectException failure) {
+            if (failures == null) {
+                failures = new ArrayList<>();
+            }
             failures.add(failure);
         }
-        if (!failures.isEmpty()) {
+        if (failures != null) {
             TickException aggregated = new TickException(
                     "Tick failed for " + failures.size() + " component(s) on " + id);
             for (Throwable failure : failures) {
@@ -478,7 +474,7 @@ public final class WorldObject {
      */
     public void defer(Runnable task) {
         Objects.requireNonNull(task, "task");
-        if (detached) {
+        if (view.detached) {
             throw new DetachedException("WorldObject " + id + " is detached");
         }
         deferred.add(task);
@@ -577,7 +573,7 @@ public final class WorldObject {
      */
     public List<String> describe() {
         List<String> result = new ArrayList<>();
-        for (ComponentEntry entry : snapshot) {
+        for (ComponentEntry entry : view.entries) {
             if (entry.type() != null) {
                 result.add(entry.type().id());
             } else {
@@ -590,7 +586,7 @@ public final class WorldObject {
     // Internals.
 
     private void requireLive() {
-        if (detached) {
+        if (view.detached) {
             throw new DetachedException("WorldObject " + id + " is detached");
         }
     }
@@ -652,6 +648,47 @@ public final class WorldObject {
 
     @Override
     public String toString() {
-        return "WorldObject{id=" + id + ", detached=" + detached + ", size=" + snapshot.size() + "}";
+        View current = view;
+        return "WorldObject{id=" + id + ", detached=" + current.detached + ", size=" + current.entries.size() + "}";
+    }
+
+    /**
+     * Immutable per-snapshot state: ordered entries plus a type index.
+     * Built once per mutation under the write lock, then shared lock-free.
+     * The index maps exact attach types to their entries in tick order; untyped
+     * components live only in {@link #entries}. Memory cost is one map plus one
+     * list per distinct type — negligible against the copy-on-write snapshot itself.
+     */
+    private static final class View {
+        static final View EMPTY = new View(List.of(), Map.of(), false);
+
+        final List<ComponentEntry> entries;
+        final Map<WorldObjectComponentType<?>, List<ComponentEntry>> byType;
+        final boolean detached;
+
+        private View(
+                List<ComponentEntry> entries,
+                Map<WorldObjectComponentType<?>, List<ComponentEntry>> byType,
+                boolean detached) {
+            this.entries = entries;
+            this.byType = byType;
+            this.detached = detached;
+        }
+
+        static View of(List<ComponentEntry> entries) {
+            List<ComponentEntry> frozen = List.copyOf(entries);
+            Map<WorldObjectComponentType<?>, List<ComponentEntry>> index = new HashMap<>();
+            for (ComponentEntry entry : frozen) {
+                if (entry.type() != null) {
+                    index.computeIfAbsent(entry.type(), key -> new ArrayList<>()).add(entry);
+                }
+            }
+            index.replaceAll((key, list) -> List.copyOf(list));
+            return new View(frozen, Map.copyOf(index), false);
+        }
+
+        View detached() {
+            return new View(List.of(), Map.of(), true);
+        }
     }
 }
