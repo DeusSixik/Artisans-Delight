@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "artisans_delight",
+  "version": "${version}",
+  "name": "Artisan's Delight",
+  "description": "Adds a system of work, trade, and workers",
+  "authors": [
+    "Sixik"
+  ],
+  "contact": {
+    "homepage": ""
+  },
+  "license": "LGPL-3.0",
+  "icon": "assets/artisans_delight/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.sixik.artisans_delight.fabric.ArtisansDelightFabric"
+    ],
+    "client": [
+      "dev.sixik.artisans_delight.fabric.client.ArtisansDelightFabricClient"
+    ]
+  },
+  "mixins": [
+    "artisans_delight.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.17.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "architectury": ">=13.0.11",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "another-mod": "*"
+  }
+}

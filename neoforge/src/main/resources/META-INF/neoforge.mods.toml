@@ -1,0 +1,38 @@
+modLoader = "javafml"
+loaderVersion = "[2,)"
+#issueTrackerURL = ""
+license = "GNU LGPL 3.0"
+
+[[mods]]
+modId = "artisans_delight"
+version = "${version}"
+displayName = "Artisan's Delight"
+authors = "Sixik"
+description = '''
+Adds a system of work, trade, and workers
+'''
+#logoFile = ""
+
+[[dependencies.artisans_delight]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.artisans_delight]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.artisans_delight]]
+modId = "architectury"
+type = "required"
+versionRange = "[13.0.11,)"
+ordering = "AFTER"
+side = "BOTH"
+
+[[mixins]]
+config = "artisans_delight.mixins.json"
