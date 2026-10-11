@@ -77,12 +77,24 @@ import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.MapColor;
+import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.levelgen.RandomState;
+import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
+import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.town.TownPortComponent;
+import dev.sixik.artisans_delight.mod.core.knot.data.KnotRouteEntry;
+import dev.sixik.artisans_delight.mod.core.knot.data.RoadPoint2D;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
 
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public class TestMap {
+
+    // === РЕЖИМ ОТОБРАЖЕНИЯ ДОРОГ И ПУТЕЙ (ЛОГИЧЕСКАЯ СЕТЬ vs РЕАЛЬНЫЕ ПУТИ) ===
+    private static boolean showRoadPaths = false;
 
     private static final MutableColor COLOR_WHITE = new MutableColor(1.0f, 1.0f, 1.0f, 1.0f);
     private static final TextureHandle ICON_NODE_TOWN = new MinecraftTextureHandle(
@@ -306,6 +318,40 @@ public class TestMap {
             }
         }
 
+        // В одиночной игре гарантируем расчет маршрутов между существующими городами
+        if (minecraft.getSingleplayerServer() != null && minecraft.level != null && knots != null) {
+            try {
+                ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                if (sLevel != null) {
+                    ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
+                    RandomState state = sLevel.getChunkSource().randomState();
+                    List<WorldObject> towns = new ArrayList<>();
+                    for (WorldObject obj : knots) {
+                        obj.getSingle(KnotMetaComponent.class).ifPresent(m -> {
+                            if (m.type.get() == KnotType.TOWN) towns.add(obj);
+                        });
+                    }
+                    for (int i = 0; i < towns.size(); i++) {
+                        WorldObject tA = towns.get(i);
+                        BlockPos pA = tA.getSingle(KnotMetaComponent.class).get().pos.get();
+                        for (int j = i + 1; j < towns.size(); j++) {
+                            WorldObject tB = towns.get(j);
+                            BlockPos pB = tB.getSingle(KnotMetaComponent.class).get().pos.get();
+                            double dist = Math.hypot(pA.getX() - pB.getX(), pA.getZ() - pB.getZ());
+                            if (dist <= 4000.0) {
+                                boolean hasRoute = tA.getSingle(KnotRoutesComponent.class)
+                                        .flatMap(r -> r.getRouteTo(tB.id())).isPresent();
+                                if (!hasRoute) {
+                                    RouteGenerator.connectKnotsAsync(tA, tB, gen, sLevel, state);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
         DefaultUIContext context = new DefaultUIContext(new MinecraftClipboardService());
         UnityLikeUIScaleProvider scale = new UnityLikeUIScaleProvider()
                 .referenceResolution(1920.0f, 1080.0f)
@@ -313,7 +359,7 @@ public class TestMap {
                 .scaleRange(0.75f, 6.0f)
                 .userScale(2.15f);
         context.scaleProvider(scale);
-        context.debugFlags(DebugFlags.PROFILER_OVERLAY);
+//        context.debugFlags(DebugFlags.PROFILER_OVERLAY);
 
         MinecraftWidgetScreen screen = new MinecraftWidgetScreen(
                 Component.literal("Artisans Delight - World Map"),
@@ -342,7 +388,35 @@ public class TestMap {
                     return true;
                 }
 
-                // 2. Escape: закрытие поиска -> закрытие окна склада -> закрытие окна рабочих -> закрытие окна дома -> выход из режима города -> закрытие карты
+                // 2. Ctrl + R: принудительный пересчет всех маршрутов дорог (сброс кэша путей)
+                if (keyCode == GLFW.GLFW_KEY_R && Screen.hasControlDown()) {
+                    if (currentKnotsCache != null && minecraft.getSingleplayerServer() != null && minecraft.level != null) {
+                        try {
+                            ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                            if (sLevel != null) {
+                                ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
+                                RandomState state = sLevel.getChunkSource().randomState();
+                                for (WorldObject obj : currentKnotsCache) {
+                                    obj.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.routes.get().clear());
+                                }
+                                for (int i = 0; i < currentKnotsCache.size(); i++) {
+                                    WorldObject tA = currentKnotsCache.get(i);
+                                    for (int j = i + 1; j < currentKnotsCache.size(); j++) {
+                                        WorldObject tB = currentKnotsCache.get(j);
+                                        RouteGenerator.connectKnotsAsync(tA, tB, gen, sLevel, state);
+                                    }
+                                }
+                                if (activeStatus != null) {
+                                    activeStatus.text("Маршруты сброшены и пересчитываются заново...");
+                                }
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    return true;
+                }
+
+                // 3. Escape: закрытие поиска -> закрытие окна склада -> закрытие окна рабочих -> закрытие окна дома -> выход из режима города -> закрытие карты
                 if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                     if (activeSearchPanel != null && activeSearchPanel.visible()) {
                         activeSearchPanel.visible(false);
@@ -604,6 +678,7 @@ public class TestMap {
             for (WorldObject obj : knotList) {
                 Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
                 Optional<KnotConnectionComponent> cOpt = obj.getSingle(KnotConnectionComponent.class);
+                Optional<KnotRoutesComponent> rOpt = obj.getSingle(KnotRoutesComponent.class);
                 if (mOpt.isEmpty() || cOpt.isEmpty()) continue;
 
                 UUID fromId = obj.id();
@@ -618,19 +693,78 @@ public class TestMap {
 
                     BlockPos toPos = posMap.get(toId);
                     if (toPos != null) {
-                        float x1 = world.worldToRootX((float) fromPos.getX());
-                        float y1 = world.worldToRootY((float) fromPos.getZ());
-                        float x2 = world.worldToRootX((float) toPos.getX());
-                        float y2 = world.worldToRootY((float) toPos.getZ());
-
                         boolean active = fromInvested && Boolean.TRUE.equals(investedMap.get(toId));
-                        if (active) {
-                            // Светящийся торговый путь
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.85f, 0.35f, 0.95f), 3.5f);
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.65f, 0.15f, 0.40f), 6.5f);
+                        Optional<KnotRouteEntry> routeOpt = rOpt.flatMap(r -> r.getRouteTo(toId));
+
+                        if (showRoadPaths && routeOpt.isPresent() && routeOpt.get().waypoints().size() >= 2) {
+                            KnotRouteEntry route = routeOpt.get();
+                            ObjectList<RoadPoint2D> pts = route.waypoints();
+
+                            if (route.isSeaRoute()) {
+                                // Морской фарватер: пунктирная лазурная линия
+                                MutableColor seaColor = active
+                                        ? new MutableColor(0.20f, 0.85f, 0.95f, 0.95f)
+                                        : new MutableColor(0.30f, 0.60f, 0.80f, 0.60f);
+                                for (int i = 0; i < pts.size() - 1; i++) {
+                                    RoadPoint2D p1 = pts.get(i);
+                                    RoadPoint2D p2 = pts.get(i + 1);
+                                    float x1 = world.worldToRootX((float) p1.x());
+                                    float y1 = world.worldToRootY((float) p1.z());
+                                    float x2 = world.worldToRootX((float) p2.x());
+                                    float y2 = world.worldToRootY((float) p2.z());
+                                    drawDashedLine(draw, x1, y1, x2, y2, seaColor, 2.5f, 8.0f, 5.0f);
+                                }
+                            } else {
+                                // Сухопутная дорога: полилиния по точкам (X, Z)
+                                MutableColor roadGlow = new MutableColor(1.0f, 0.65f, 0.15f, 0.35f);
+                                MutableColor roadColor = active
+                                        ? new MutableColor(1.0f, 0.85f, 0.35f, 0.95f)
+                                        : new MutableColor(0.60f, 0.55f, 0.45f, 0.70f);
+
+                                for (int i = 0; i < pts.size() - 1; i++) {
+                                    RoadPoint2D p1 = pts.get(i);
+                                    RoadPoint2D p2 = pts.get(i + 1);
+                                    float x1 = world.worldToRootX((float) p1.x());
+                                    float y1 = world.worldToRootY((float) p1.z());
+                                    float x2 = world.worldToRootX((float) p2.x());
+                                    float y2 = world.worldToRootY((float) p2.z());
+
+                                    boolean isBridge = p1.isBridge() && p2.isBridge();
+                                    if (isBridge) {
+                                        // Опоры моста по краям на берегу
+                                        draw.addCircleFilled(x1, y1, 3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
+                                        draw.addCircleFilled(x2, y2, 3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
+
+                                        // Темная балка моста (подложка / перила)
+                                        draw.addLine(x1, y1, x2, y2, new MutableColor(0.24f, 0.16f, 0.10f, 0.95f), active ? 5.5f : 4.5f);
+                                        // Деревянный настил моста
+                                        MutableColor bridgeDeck = active
+                                                ? new MutableColor(1.0f, 0.85f, 0.45f, 1.0f)
+                                                : new MutableColor(0.88f, 0.68f, 0.42f, 0.95f);
+                                        draw.addLine(x1, y1, x2, y2, bridgeDeck, active ? 3.0f : 2.2f);
+                                    } else {
+                                        if (active) {
+                                            draw.addLine(x1, y1, x2, y2, roadGlow, 5.5f);
+                                        }
+                                        draw.addLine(x1, y1, x2, y2, roadColor, active ? 3.0f : 2.0f);
+                                    }
+                                }
+                            }
                         } else {
-                            // Неактивная дорога
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(0.40f, 0.52f, 0.68f, 0.60f), 2.0f);
+                            // Логическая сеть узлов: прямая связь
+                            float x1 = world.worldToRootX((float) fromPos.getX());
+                            float y1 = world.worldToRootY((float) fromPos.getZ());
+                            float x2 = world.worldToRootX((float) toPos.getX());
+                            float y2 = world.worldToRootY((float) toPos.getZ());
+
+                            if (active) {
+                                // Светящийся торговый путь
+                                draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.85f, 0.35f, 0.95f), 3.5f);
+                                draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.65f, 0.15f, 0.40f), 6.5f);
+                            } else {
+                                // Неактивная дорога
+                                draw.addLine(x1, y1, x2, y2, new MutableColor(0.40f, 0.52f, 0.68f, 0.60f), 2.0f);
+                            }
                         }
                     }
                 }
@@ -643,18 +777,54 @@ public class TestMap {
             for (PseudoEdge edge : pseudoEdges) {
                 if (drawnEdges.contains(edge.key())) continue;
 
-                float x1 = world.worldToRootX((float) edge.posA.getX());
-                float y1 = world.worldToRootY((float) edge.posA.getZ());
-                float x2 = world.worldToRootX((float) edge.posB.getX());
-                float y2 = world.worldToRootY((float) edge.posB.getZ());
+                if (showRoadPaths && edge.waypoints() != null && edge.waypoints().size() >= 2) {
+                    ObjectList<RoadPoint2D> pts = edge.waypoints();
+                    if (edge.isSea()) {
+                        MutableColor pseudoSeaColor = new MutableColor(0.30f, 0.70f, 0.90f, 0.50f);
+                        for (int i = 0; i < pts.size() - 1; i++) {
+                            RoadPoint2D p1 = pts.get(i);
+                            RoadPoint2D p2 = pts.get(i + 1);
+                            float x1 = world.worldToRootX((float) p1.x());
+                            float y1 = world.worldToRootY((float) p1.z());
+                            float x2 = world.worldToRootX((float) p2.x());
+                            float y2 = world.worldToRootY((float) p2.z());
+                            drawDashedLine(draw, x1, y1, x2, y2, pseudoSeaColor, 1.8f, 7.0f, 5.0f);
+                        }
+                    } else {
+                        MutableColor pseudoRoadColor = new MutableColor(0.55f, 0.60f, 0.68f, 0.55f);
+                        for (int i = 0; i < pts.size() - 1; i++) {
+                            RoadPoint2D p1 = pts.get(i);
+                            RoadPoint2D p2 = pts.get(i + 1);
+                            float x1 = world.worldToRootX((float) p1.x());
+                            float y1 = world.worldToRootY((float) p1.z());
+                            float x2 = world.worldToRootX((float) p2.x());
+                            float y2 = world.worldToRootY((float) p2.z());
 
-                // Пунктирная псевдо-линия
-                drawDashedLine(draw, x1, y1, x2, y2, pseudoColor, 1.8f, 10.0f, 6.0f);
+                            boolean isBridge = p1.isBridge() && p2.isBridge();
+                            if (isBridge) {
+                                draw.addCircleFilled(x1, y1, 2.5f, new MutableColor(0.28f, 0.20f, 0.14f, 0.85f), 8);
+                                draw.addCircleFilled(x2, y2, 2.5f, new MutableColor(0.28f, 0.20f, 0.14f, 0.85f), 8);
+                                draw.addLine(x1, y1, x2, y2, new MutableColor(0.24f, 0.16f, 0.10f, 0.80f), 3.8f);
+                                draw.addLine(x1, y1, x2, y2, new MutableColor(0.78f, 0.62f, 0.40f, 0.90f), 2.0f);
+                            } else {
+                                draw.addLine(x1, y1, x2, y2, pseudoRoadColor, 1.8f);
+                            }
+                        }
+                    }
+                } else {
+                    float x1 = world.worldToRootX((float) edge.posA.getX());
+                    float y1 = world.worldToRootY((float) edge.posA.getZ());
+                    float x2 = world.worldToRootX((float) edge.posB.getX());
+                    float y2 = world.worldToRootY((float) edge.posB.getZ());
 
-                // Точка на середине пути
-                float mx = (x1 + x2) * 0.5f;
-                float my = (y1 + y2) * 0.5f;
-                draw.addCircleFilled(mx, my, 3.0f, pseudoPointColor, 8);
+                    // Пунктирная псевдо-линия
+                    drawDashedLine(draw, x1, y1, x2, y2, pseudoColor, 1.8f, 10.0f, 6.0f);
+
+                    // Точка на середине пути
+                    float mx = (x1 + x2) * 0.5f;
+                    float my = (y1 + y2) * 0.5f;
+                    draw.addCircleFilled(mx, my, 3.0f, pseudoPointColor, 8);
+                }
             }
 
             // === 6. ОРЕОЛЫ И МАРКЕРЫ УЗЛОВ ===
@@ -689,6 +859,21 @@ public class TestMap {
                                 new MutableColor(1.0f, 0.85f, 0.30f, 0.75f), 48, 2.0f);
                         draw.addCircleFilled(kx, ky, limitRadius,
                                 new MutableColor(1.0f, 0.80f, 0.20f, 0.05f), 48);
+                    }
+
+                    // Если город прибрежный (порт) - рисуем маркер причала у воды
+                    Optional<TownPortComponent> portOpt = obj.getSingle(TownPortComponent.class);
+                    if (portOpt.isPresent()) {
+                        BlockPos pier = portOpt.get().pierPos.get();
+                        float px = world.worldToRootX((float) pier.getX());
+                        float py = world.worldToRootY((float) pier.getZ());
+
+                        // Причал / верфь на берегу
+                        draw.addCircleFilled(px, py, 5.0f, new MutableColor(0.20f, 0.85f, 0.95f, 0.85f), 12);
+                        draw.addCircle(px, py, 7.5f, new MutableColor(1.0f, 1.0f, 1.0f, 0.70f), 12, 1.2f);
+
+                        // Пунктирный съезд от центра поселения к причалу
+                        drawDashedLine(draw, kx, ky, px, py, new MutableColor(0.30f, 0.80f, 0.95f, 0.50f), 1.5f, 4.0f, 3.0f);
                     }
                 }
 
@@ -813,6 +998,54 @@ public class TestMap {
         filterTooltip.offset(4.0f, 6.0f);
         rootOverlay.addOverlay(filterTooltip);
         topBar.addChild(filterBtn);
+
+        topBar.addChild(createTopBarDivider());
+
+        // 0.25 Кнопка переключения режима дорог и путей
+        Button roadModeBtn = new Button("");
+        roadModeBtn.layout(s -> s.width(28.0f).height(26.0f));
+        roadModeBtn.backgroundVisible(false);
+        roadModeBtn.borderVisible(false);
+        roadModeBtn.renderer((draw, w) -> {
+            RectView b = w.layoutBounds();
+            float x = b.x();
+            float y = b.y();
+            float width = b.width();
+            float height = b.height();
+            boolean hovered = roadModeBtn.hovered();
+
+            if (showRoadPaths) {
+                draw.addRectFilled(x, y, width, height, 3.0f, new MutableColor(1.0f, 0.80f, 0.20f, 0.25f));
+                draw.addRect(x, y, width, height, 3.0f, new MutableColor(1.0f, 0.85f, 0.35f, 0.85f), 1.0f);
+            } else if (hovered) {
+                draw.addRectFilled(x, y, width, height, 3.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.14f));
+            }
+
+            float sz = 18.0f;
+            float ix = x + (width - sz) * 0.5f;
+            float iy = y + (height - sz) * 0.5f;
+            MutableColor tint = showRoadPaths
+                    ? new MutableColor(1.0f, 0.88f, 0.30f, 1.0f)
+                    : (hovered ? new MutableColor(1.0f, 0.90f, 0.45f, 1.0f) : new MutableColor(0.85f, 0.88f, 0.92f, 0.90f));
+            draw.addImage(ICON_NODE_KNOT, ix, iy, sz, sz, tint);
+        });
+
+        Tooltip roadModeTooltip = new Tooltip(roadModeBtn, "Режим отображения: Логическая сеть узлов (Нажмите для включения реальных дорог)");
+        roadModeTooltip.background().set(0.08f, 0.09f, 0.12f, 0.95f);
+        roadModeTooltip.borderColor().set(0.85f, 0.70f, 0.25f, 0.90f);
+        roadModeTooltip.radius(4.0f);
+        roadModeTooltip.borderWidth(1.2f);
+        roadModeTooltip.offset(4.0f, 6.0f);
+        rootOverlay.addOverlay(roadModeTooltip);
+
+        roadModeBtn.onClick(e -> {
+            showRoadPaths = !showRoadPaths;
+            roadModeTooltip.richText(RichText.builder().append(showRoadPaths
+                    ? "Режим отображения: Реальные дороги и фарватеры (Активен)"
+                    : "Режим отображения: Логическая сеть узлов (BDO)").build());
+            roadModeTooltip.invalidate(InvalidationFlags.LAYOUT | InvalidationFlags.VISUAL);
+        });
+        topBar.addChild(roadModeBtn);
 
         topBar.addChild(createTopBarDivider());
 
@@ -1121,7 +1354,8 @@ public class TestMap {
                 }
             });
 
-            Tooltip tooltip = new Tooltip(marker, buildNodeTooltip(meta, connOpt, prodOpt));
+            Tooltip tooltip = new Tooltip(marker, buildNodeTooltip(meta, connOpt, prodOpt,
+                    knot.getSingle(TownPortComponent.class), knot.getSingle(KnotRoutesComponent.class)));
             tooltip.background().set(0.08f, 0.09f, 0.12f, 0.95f);
             tooltip.borderColor().set(0.85f, 0.70f, 0.25f, 0.90f);
             tooltip.radius(4.0f);
@@ -1197,7 +1431,8 @@ public class TestMap {
                 marker.onClick(event -> {
                     connOpt.ifPresent(conn -> conn.isInvested.update(v -> !v));
                     updateContributionPointsDisplay();
-                    tooltip.richText(buildNodeTooltip(meta, connOpt, prodOpt));
+                    tooltip.richText(buildNodeTooltip(meta, connOpt, prodOpt,
+                            knot.getSingle(TownPortComponent.class), knot.getSingle(KnotRoutesComponent.class)));
                 });
             }
 
@@ -1224,6 +1459,15 @@ public class TestMap {
             KnotMetaComponent meta,
             Optional<KnotConnectionComponent> connOpt,
             Optional<KnotProductionComponent> prodOpt) {
+        return buildNodeTooltip(meta, connOpt, prodOpt, Optional.empty(), Optional.empty());
+    }
+
+    private static RichText buildNodeTooltip(
+            KnotMetaComponent meta,
+            Optional<KnotConnectionComponent> connOpt,
+            Optional<KnotProductionComponent> prodOpt,
+            Optional<TownPortComponent> portOpt,
+            Optional<KnotRoutesComponent> routesOpt) {
         BlockPos pos = meta.pos.get();
         String name = meta.name.get();
         KnotType type = meta.type.get();
@@ -1253,6 +1497,14 @@ public class TestMap {
         builder.color(new MutableColor(0.40f, 0.75f, 1.0f, 1.0f))
                .append("Type: " + typeName + "\n");
 
+        // Если узел является морским портом
+        if (portOpt != null && portOpt.isPresent()) {
+            BlockPos pier = portOpt.get().pierPos.get();
+            builder.color(new MutableColor(0.20f, 0.85f, 0.95f, 1.0f))
+                   .append(String.format(Locale.ROOT, "⚓ Port Pier: [%d, %d] (Ships: %d)\n",
+                           pier.getX(), pier.getZ(), portOpt.get().shipCapacity.get()));
+        }
+
         // Статус инвестиции (зеленый / оранжевый)
         if (invested) {
             builder.color(new MutableColor(0.35f, 0.95f, 0.45f, 1.0f))
@@ -1265,6 +1517,12 @@ public class TestMap {
         if (neighborsCount > 0) {
             builder.color(new MutableColor(0.70f, 0.70f, 0.70f, 1.0f))
                    .append("Connections: " + neighborsCount + "\n");
+        }
+
+        if (routesOpt != null && routesOpt.isPresent() && !routesOpt.get().routes.get().isEmpty()) {
+            int routesCount = routesOpt.get().routes.get().size();
+            builder.color(new MutableColor(0.85f, 0.75f, 0.40f, 1.0f))
+                   .append("Physical Routes: " + routesCount + "\n");
         }
 
         // Подсказка действия
@@ -1523,13 +1781,43 @@ public class TestMap {
     /**
      * Построение псевдо-соединений (Proximity Network) между ближайшими узлами.
      */
-    private record PseudoEdge(UUID a, UUID b, BlockPos posA, BlockPos posB, double distance) {
+    private record PseudoEdge(UUID a, UUID b, BlockPos posA, BlockPos posB, double distance,
+                              ObjectList<RoadPoint2D> waypoints, boolean isSea) {
         public String key() {
             return a.compareTo(b) < 0 ? a + "_" + b : b + "_" + a;
         }
     }
 
-    private record NeighborCandidate(UUID id, BlockPos pos, double dist) {
+    private record NeighborCandidate(WorldObject obj, BlockPos pos, double dist) {
+    }
+
+    private static PseudoEdge createPseudoEdge(WorldObject objA, WorldObject objB, BlockPos posA, BlockPos posB, double dist) {
+        Optional<KnotRoutesComponent> rOptA = objA.getSingle(KnotRoutesComponent.class);
+        Optional<KnotRouteEntry> routeA = rOptA.flatMap(r -> r.getRouteTo(objB.id()));
+        if (routeA.isPresent() && routeA.get().waypoints().size() >= 2) {
+            KnotRouteEntry r = routeA.get();
+            return new PseudoEdge(objA.id(), objB.id(), posA, posB, dist, r.waypoints(), r.isSeaRoute());
+        }
+
+        // Если путь еще не построен, но доступен сервер мира (singleplayer): запускаем асинхронный расчет без фриза UI
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.getSingleplayerServer() != null && mc.level != null) {
+            try {
+                ServerLevel sLevel = mc.getSingleplayerServer().getLevel(mc.level.dimension());
+                if (sLevel != null) {
+                    ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
+                    RandomState state = sLevel.getChunkSource().randomState();
+                    RouteGenerator.connectKnotsAsync(objA, objB, gen, sLevel, state);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Прямая линия между узлами (без ложных кривых через реки/океаны)
+        ObjectList<RoadPoint2D> directWaypoints = new ObjectArrayList<>();
+        directWaypoints.add(new RoadPoint2D(posA.getX(), posA.getZ()));
+        directWaypoints.add(new RoadPoint2D(posB.getX(), posB.getZ()));
+        return new PseudoEdge(objA.id(), objB.id(), posA, posB, dist, directWaypoints, false);
     }
 
     private static List<PseudoEdge> buildPseudoEdges(List<WorldObject> knots) {
@@ -1540,7 +1828,6 @@ public class TestMap {
             WorldObject objA = knots.get(i);
             KnotMetaComponent metaA = objA.getSingle(KnotMetaComponent.class).get();
             BlockPos posA = metaA.pos.get();
-            UUID idA = objA.id();
 
             List<NeighborCandidate> candidates = new ArrayList<>();
             for (int j = 0; j < knots.size(); j++) {
@@ -1549,7 +1836,7 @@ public class TestMap {
                 KnotMetaComponent metaB = objB.getSingle(KnotMetaComponent.class).get();
                 BlockPos posB = metaB.pos.get();
                 double dist = Math.hypot(posA.getX() - posB.getX(), posA.getZ() - posB.getZ());
-                candidates.add(new NeighborCandidate(objB.id(), posB, dist));
+                candidates.add(new NeighborCandidate(objB, posB, dist));
             }
 
             candidates.sort(Comparator.comparingDouble(NeighborCandidate::dist));
@@ -1558,7 +1845,7 @@ public class TestMap {
             if (!candidates.isEmpty()) {
                 NeighborCandidate c1 = candidates.get(0);
                 if (c1.dist <= 6000.0) {
-                    PseudoEdge e = new PseudoEdge(idA, c1.id, posA, c1.pos, c1.dist);
+                    PseudoEdge e = createPseudoEdge(objA, c1.obj, posA, c1.pos, c1.dist);
                     edges.putIfAbsent(e.key(), e);
                 }
             }
@@ -1568,7 +1855,7 @@ public class TestMap {
                 NeighborCandidate c1 = candidates.get(0);
                 NeighborCandidate c2 = candidates.get(1);
                 if (c2.dist <= 6000.0 && c2.dist <= c1.dist * 1.85) {
-                    PseudoEdge e = new PseudoEdge(idA, c2.id, posA, c2.pos, c2.dist);
+                    PseudoEdge e = createPseudoEdge(objA, c2.obj, posA, c2.pos, c2.dist);
                     edges.putIfAbsent(e.key(), e);
                 }
             }
@@ -1578,7 +1865,7 @@ public class TestMap {
                 NeighborCandidate c1 = candidates.get(0);
                 NeighborCandidate c3 = candidates.get(2);
                 if (c3.dist <= 4000.0 && c3.dist <= c1.dist * 1.35) {
-                    PseudoEdge e = new PseudoEdge(idA, c3.id, posA, c3.pos, c3.dist);
+                    PseudoEdge e = createPseudoEdge(objA, c3.obj, posA, c3.pos, c3.dist);
                     edges.putIfAbsent(e.key(), e);
                 }
             }
@@ -2062,6 +2349,16 @@ public class TestMap {
         Label craftLabel = new Label(String.format(Locale.ROOT, "⚙ Ремесло: %d плав. | %d маст. | %d кузн.", smelteries, workshops, forges));
         craftLabel.color(new MutableColor(0.85f, 0.88f, 0.92f, 1.0f));
         activeLeftContent.addChild(craftLabel);
+
+        Optional<TownPortComponent> portOpt = town.getSingle(TownPortComponent.class);
+        if (portOpt.isPresent()) {
+            TownPortComponent port = portOpt.get();
+            BlockPos pier = port.pierPos.get();
+            Label portLabel = new Label(String.format(Locale.ROOT, "⚓ Порт: [%d, %d] (Судов: %d)",
+                    pier.getX(), pier.getZ(), port.shipCapacity.get()));
+            portLabel.color(new MutableColor(0.25f, 0.85f, 0.95f, 1.0f));
+            activeLeftContent.addChild(portLabel);
+        }
 
         // Список недвижимости города
         Label housesTitle = new Label("─── Дома в городе (" + houses.size() + ") ───");

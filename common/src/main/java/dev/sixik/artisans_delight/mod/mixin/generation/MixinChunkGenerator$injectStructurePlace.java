@@ -7,12 +7,17 @@ import dev.sixik.artisans_delight.mod.api.ArtisansDelightConstants;
 import dev.sixik.artisans_delight.mod.api.KnotApi;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationData;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationHook;
+import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
+import dev.sixik.artisans_delight.mod.core.generation.terrain.TerrainSampler;
 import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownLodgingComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.town.TownPortComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownWarehouseComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownWorkshopsComponent;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.SectionPos;
 import net.minecraft.resources.ResourceLocation;
@@ -29,6 +34,8 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+import java.util.Optional;
 
 @Mixin(ChunkGenerator.class)
 public class MixinChunkGenerator$injectStructurePlace {
@@ -59,9 +66,31 @@ public class MixinChunkGenerator$injectStructurePlace {
         townKnot.attach(new KnotMetaComponent("Оливия_" + sectionPos.asLong(), ResourceLocation.tryBuild("minecraft", "air"),
                 KnotType.TOWN, sectionPos.origin()));
         townKnot.attach(new KnotConnectionComponent());
+        townKnot.attach(new KnotRoutesComponent());
         townKnot.attach(new TownWarehouseComponent());
         townKnot.attach(new TownLodgingComponent());
         townKnot.attach(new TownWorkshopsComponent());
+
+        // Проверяем, является ли поселение прибрежным портом
+        ChunkGenerator chunkGenerator = (ChunkGenerator) (Object) this;
+        Optional<BlockPos> pierPos = TerrainSampler.findCoastlinePier(
+                chunkGenerator, data.getGenLevel(), randomState, sectionPos.origin(), 180);
+        pierPos.ifPresent(pos -> townKnot.attach(new TownPortComponent(pos)));
+
         manager.add(townKnot);
+
+        // Автоматически строим дороги к ближайшим городам (до 4000 блоков)
+        for (WorldObject existing : manager.all()) {
+            if (existing == townKnot) continue;
+            Optional<KnotMetaComponent> existingMeta = existing.getSingle(KnotMetaComponent.class);
+            if (existingMeta.isPresent() && existingMeta.get().type.get() == KnotType.TOWN) {
+                BlockPos otherPos = existingMeta.get().pos.get();
+                double dist = Math.hypot(sectionPos.origin().getX() - otherPos.getX(),
+                                         sectionPos.origin().getZ() - otherPos.getZ());
+                if (dist <= 4000.0) {
+                    RouteGenerator.connectKnotsAsync(townKnot, existing, chunkGenerator, data.getGenLevel(), randomState);
+                }
+            }
+        }
     }
 }
