@@ -147,9 +147,26 @@ public final class CoarsePathfinder {
     /**
      * Поиск сухопутной дороги между двумя точками с возможностью постройки мостов через реки.
      */
+    @FunctionalInterface
+    public interface PathConstraint {
+        PathConstraint NONE = (x, z) -> 0.0;
+
+        /**
+         * Дополнительный штраф за проход через координаты (x, z).
+         * Если возвращает Double.POSITIVE_INFINITY или >= 99999.0 — проход строго запрещен.
+         */
+        double getExtraCost(int x, int z);
+    }
+
     public static ObjectList<RoadPoint2D> findLandRoad(
             ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
             int startX, int startZ, int goalX, int goalZ) {
+        return findLandRoad(generator, heightAccessor, randomState, startX, startZ, goalX, goalZ, PathConstraint.NONE);
+    }
+
+    public static ObjectList<RoadPoint2D> findLandRoad(
+            ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
+            int startX, int startZ, int goalX, int goalZ, PathConstraint constraint) {
 
         FastTerrainCache cache = new FastTerrainCache(generator, heightAccessor, randomState);
 
@@ -172,12 +189,12 @@ public final class CoarsePathfinder {
             fallbackStep = 24;
         }
 
-        ObjectList<RoadPoint2D> path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, primaryStep);
+        ObjectList<RoadPoint2D> path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, primaryStep, constraint);
         if (!path.isEmpty()) {
             return ensureEndpoints(path, startX, startZ, goalX, goalZ);
         }
 
-        path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, fallbackStep);
+        path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, fallbackStep, constraint);
         if (!path.isEmpty()) {
             return ensureEndpoints(path, startX, startZ, goalX, goalZ);
         }
@@ -213,6 +230,12 @@ public final class CoarsePathfinder {
     public static ObjectList<RoadPoint2D> findPath(
             FastTerrainCache cache,
             int startX, int startZ, int goalX, int goalZ, boolean isSea, int step) {
+        return findPath(cache, startX, startZ, goalX, goalZ, isSea, step, PathConstraint.NONE);
+    }
+
+    public static ObjectList<RoadPoint2D> findPath(
+            FastTerrainCache cache,
+            int startX, int startZ, int goalX, int goalZ, boolean isSea, int step, PathConstraint constraint) {
 
         int gridStartX = Math.round((float) startX / step) * step;
         int gridStartZ = Math.round((float) startZ / step) * step;
@@ -273,6 +296,11 @@ public final class CoarsePathfinder {
                     continue; // Непроходимо
                 }
 
+                double extraCost = constraint.getExtraCost(nx, nz);
+                if (Double.isInfinite(extraCost) || extraCost >= 99999.0) {
+                    continue; // Запретная зона препятствия
+                }
+
                 // Дополнительный разовый штраф за вход на мост (с суши в воду):
                 // заставляет алгоритм предпочитать огибать реку по суше, а не строить мосты туда-обратно
                 double bridgeCost = 0.0;
@@ -280,7 +308,7 @@ public final class CoarsePathfinder {
                     bridgeCost = 250.0;
                 }
 
-                double tentativeG = current.gCost + stepDist * moveMultiplier + bridgeCost;
+                double tentativeG = current.gCost + stepDist * moveMultiplier + bridgeCost + extraCost;
                 double recordedG = gScores.getOrDefault(nPacked, Double.MAX_VALUE);
 
                 if (tentativeG < recordedG) {

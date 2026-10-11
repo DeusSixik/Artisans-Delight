@@ -8,7 +8,9 @@ import dev.sixik.artisans_delight.mod.api.KnotApi;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationData;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationHook;
 import dev.sixik.artisans_delight.mod.core.generation.path.KnotNetworkGraph;
+import dev.sixik.artisans_delight.mod.core.generation.path.RoadPavingService;
 import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
+import dev.sixik.artisans_delight.mod.core.generation.path.SeedStructureLookahead;
 import dev.sixik.artisans_delight.mod.core.generation.terrain.TerrainSampler;
 import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
@@ -48,6 +50,13 @@ public class MixinChunkGenerator$injectStructurePlace {
         GenerationHook.applyLevelForWorldGeneration(worldGenLevel, chunkAccess, structureManager);
     }
 
+    @Inject(method = "applyBiomeDecoration", at = @At("RETURN"))
+    public void sdm$applyBiomeDecorationAfter(
+            WorldGenLevel worldGenLevel, ChunkAccess chunkAccess,
+            StructureManager structureManager, CallbackInfo ci) {
+        RoadPavingService.paveChunk(worldGenLevel, chunkAccess);
+    }
+
     @Inject(method = "tryGenerateStructure", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/level/StructureManager;setStartForStructure(Lnet/minecraft/core/SectionPos;Lnet/minecraft/world/level/levelgen/structure/Structure;Lnet/minecraft/world/level/levelgen/structure/StructureStart;Lnet/minecraft/world/level/chunk/StructureAccess;)V", shift = At.Shift.AFTER))
     public void sdm$tryGenerateStructure(StructureSet.StructureSelectionEntry structureSelectionEntry,
                                          StructureManager structureManager, RegistryAccess registryAccess,
@@ -63,24 +72,48 @@ public class MixinChunkGenerator$injectStructurePlace {
         final GenerationData data = GenerationHook.getLevelForWorldGeneration();
         final WorldObjectManager manager = WorldObjectManagerApi.getManager(data.getGenLevel().getLevel());
 
-        WorldObject townKnot = new WorldObject();
-        townKnot.attach(new KnotMetaComponent("Оливия_" + sectionPos.asLong(), ResourceLocation.tryBuild("minecraft", "air"),
-                KnotType.TOWN, sectionPos.origin()));
-        townKnot.attach(new KnotConnectionComponent());
-        townKnot.attach(new KnotRoutesComponent());
-        townKnot.attach(new TownWarehouseComponent());
-        townKnot.attach(new TownLodgingComponent());
-        townKnot.attach(new TownWorkshopsComponent());
-
-        // Проверяем, является ли поселение прибрежным портом
+        BlockPos origin = sectionPos.origin();
         ChunkGenerator chunkGenerator = (ChunkGenerator) (Object) this;
-        Optional<BlockPos> pierPos = TerrainSampler.findCoastlinePier(
-                chunkGenerator, data.getGenLevel(), randomState, sectionPos.origin(), 180);
-        pierPos.ifPresent(pos -> townKnot.attach(new TownPortComponent(pos)));
 
-        manager.add(townKnot);
+        // 1. Проверяем, был ли этот узел уже предсказан сид-лукахедом:
+        Optional<WorldObject> nearby = SeedStructureLookahead.findNearbyKnot(manager, origin, 128.0);
+        WorldObject townKnot;
 
-        // Автоматически подключаем поселение к сети узлов мира без создания лишних прямых срезок
+        if (nearby.isPresent()) {
+            townKnot = nearby.get();
+            // Дооснащаем предсказанный узел игровыми компонентами поселения
+            if (townKnot.getSingle(TownWarehouseComponent.class).isEmpty()) townKnot.attach(new TownWarehouseComponent());
+            if (townKnot.getSingle(TownLodgingComponent.class).isEmpty()) townKnot.attach(new TownLodgingComponent());
+            if (townKnot.getSingle(TownWorkshopsComponent.class).isEmpty()) townKnot.attach(new TownWorkshopsComponent());
+
+            if (townKnot.getSingle(TownPortComponent.class).isEmpty()) {
+                Optional<BlockPos> pierPos = TerrainSampler.findCoastlinePier(
+                        chunkGenerator, data.getGenLevel(), randomState, origin, 180);
+                pierPos.ifPresent(pos -> townKnot.attach(new TownPortComponent(pos)));
+            }
+        } else {
+            townKnot = new WorldObject();
+            townKnot.attach(new KnotMetaComponent("Оливия_" + sectionPos.asLong(), ResourceLocation.tryBuild("minecraft", "air"),
+                    KnotType.TOWN, origin));
+            townKnot.attach(new KnotConnectionComponent());
+            townKnot.attach(new KnotRoutesComponent());
+            townKnot.attach(new TownWarehouseComponent());
+            townKnot.attach(new TownLodgingComponent());
+            townKnot.attach(new TownWorkshopsComponent());
+
+            Optional<BlockPos> pierPos = TerrainSampler.findCoastlinePier(
+                    chunkGenerator, data.getGenLevel(), randomState, origin, 180);
+            pierPos.ifPresent(pos -> townKnot.attach(new TownPortComponent(pos)));
+
+            manager.add(townKnot);
+        }
+
+        // 2. Сканируем и предсказываем соседние узлы по сиду мира (радиус 3000 блоков)
+        SeedStructureLookahead.predictKnotsInRange(
+                manager, data.getGenLevel().getLevel(), chunkGenerator, randomState, origin, 3000
+        );
+
+        // 3. Автоматически подключаем поселение к сети узлов мира без создания лишних прямых срезок
         KnotNetworkGraph.connectNewKnot(townKnot, manager, chunkGenerator, data.getGenLevel(), randomState);
     }
 }

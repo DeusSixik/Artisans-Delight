@@ -81,6 +81,7 @@ import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.RandomState;
 import dev.sixik.artisans_delight.mod.core.generation.path.KnotNetworkGraph;
 import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
+import dev.sixik.artisans_delight.mod.core.generation.path.SeedStructureLookahead;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownPortComponent;
 import dev.sixik.artisans_delight.mod.core.knot.data.KnotRouteEntry;
@@ -326,6 +327,11 @@ public class TestMap {
                 if (sLevel != null) {
                     ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
                     RandomState state = sLevel.getChunkSource().randomState();
+                    BlockPos center = minecraft.player != null ? minecraft.player.blockPosition() : BlockPos.ZERO;
+                    if (manager != null) {
+                        SeedStructureLookahead.predictKnotsInRange(manager, sLevel, gen, state, center, 3500);
+                        knots = manager.all();
+                    }
                     KnotNetworkGraph.rebuildNetwork(knots, gen, sLevel, state);
                 }
             } catch (Throwable ignored) {
@@ -376,6 +382,12 @@ public class TestMap {
                             if (sLevel != null) {
                                 ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
                                 RandomState state = sLevel.getChunkSource().randomState();
+                                BlockPos center = minecraft.player != null ? minecraft.player.blockPosition() : BlockPos.ZERO;
+                                WorldObjectManager mgr = WorldObjectManagerApi.getManager(sLevel);
+                                if (mgr != null) {
+                                    SeedStructureLookahead.predictKnotsInRange(mgr, sLevel, gen, state, center, 3500);
+                                    currentKnotsCache = new ArrayList<>(mgr.all());
+                                }
                                 for (WorldObject obj : currentKnotsCache) {
                                     obj.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.routes.get().clear());
                                     obj.getSingle(KnotConnectionComponent.class).ifPresent(c -> c.neighbors.get().clear());

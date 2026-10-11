@@ -23,7 +23,16 @@ public class KnotRoutesComponent extends SyncedWorldObjectComponent {
             ObjectLists.emptyList()
     );
 
+    public final TrackedField<ObjectList<KnotRouteEntry>> baselineRoutes = tracked(
+            "baseline_routes",
+            FieldCodecs.listOf(KnotRouteEntry.CODEC),
+            ObjectLists.emptyList()
+    );
+
     public void addOrUpdateRoute(KnotRouteEntry route) {
+        if (getBaselineRouteTo(route.targetKnotId()).isEmpty()) {
+            setBaselineRoute(route);
+        }
         routes.update(list -> {
             ObjectList<KnotRouteEntry> next = new ObjectArrayList<>(list);
             next.removeIf(r -> r.targetKnotId().equals(route.targetKnotId()));
@@ -32,8 +41,45 @@ public class KnotRoutesComponent extends SyncedWorldObjectComponent {
         });
     }
 
+    public void setBaselineRoute(KnotRouteEntry route) {
+        baselineRoutes.update(list -> {
+            ObjectList<KnotRouteEntry> next = new ObjectArrayList<>(list);
+            next.removeIf(r -> r.targetKnotId().equals(route.targetKnotId()));
+            next.add(route);
+            return next;
+        });
+    }
+
+    public Optional<KnotRouteEntry> getBaselineRouteTo(UUID targetKnotId) {
+        for (KnotRouteEntry entry : baselineRoutes.get()) {
+            if (entry.targetKnotId().equals(targetKnotId)) {
+                return Optional.of(entry);
+            }
+        }
+        return Optional.empty();
+    }
+
+    public boolean restoreBaselineRoute(UUID targetKnotId) {
+        Optional<KnotRouteEntry> base = getBaselineRouteTo(targetKnotId);
+        if (base.isPresent()) {
+            routes.update(list -> {
+                ObjectList<KnotRouteEntry> next = new ObjectArrayList<>(list);
+                next.removeIf(r -> r.targetKnotId().equals(targetKnotId));
+                next.add(base.get());
+                return next;
+            });
+            return true;
+        }
+        return false;
+    }
+
     public void removeRoute(UUID targetKnotId) {
         routes.update(list -> {
+            ObjectList<KnotRouteEntry> next = new ObjectArrayList<>(list);
+            next.removeIf(r -> r.targetKnotId().equals(targetKnotId));
+            return next;
+        });
+        baselineRoutes.update(list -> {
             ObjectList<KnotRouteEntry> next = new ObjectArrayList<>(list);
             next.removeIf(r -> r.targetKnotId().equals(targetKnotId));
             return next;

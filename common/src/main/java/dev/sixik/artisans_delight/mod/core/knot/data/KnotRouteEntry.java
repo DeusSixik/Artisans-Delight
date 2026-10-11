@@ -34,7 +34,7 @@ public record KnotRouteEntry(
                 long[] packed = new long[entry.waypoints().size()];
                 for (int i = 0; i < packed.length; i++) {
                     RoadPoint2D pt = entry.waypoints().get(i);
-                    packed[i] = RoadPoint2D.pack(pt.x(), pt.z());
+                    packed[i] = RoadPoint2D.pack(pt.x(), pt.z(), pt.isBridge());
                 }
                 nbt.putLongArray("points", packed);
             },
