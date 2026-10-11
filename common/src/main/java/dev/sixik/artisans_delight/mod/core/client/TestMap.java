@@ -1,5 +1,6 @@
 package dev.sixik.artisans_delight.mod.core.client;
 
+import com.mojang.blaze3d.platform.NativeImage;
 import dev.sixik.artisans_delight.libs.world.WorldObject;
 import dev.sixik.artisans_delight.libs.world.WorldObjectManager;
 import dev.sixik.artisans_delight.libs.world.minecraft.WorldObjectManagerApi;
@@ -7,18 +8,27 @@ import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotProductionComponent;
+import dev.sixik.unigui.api.core.InvalidationFlags;
 import dev.sixik.unigui.api.core.UnityLikeUIScaleProvider;
 import dev.sixik.unigui.api.debug.DebugFlags;
+import dev.sixik.unigui.api.event.PointerEnteredEvent;
 import dev.sixik.unigui.api.layout.LayoutConstraints;
 import dev.sixik.unigui.api.math.MutableColor;
 import dev.sixik.unigui.api.render.DrawScope;
+import dev.sixik.unigui.api.render.TextureHandle;
+import dev.sixik.unigui.api.render.TextureOptions;
 import dev.sixik.unigui.api.render.UiRenderPolicy;
+import dev.sixik.unigui.api.text.RichText;
 import dev.sixik.unigui.api.widget.Widget;
 import dev.sixik.unigui.backend.minecraft_impl.MinecraftClipboardService;
+import dev.sixik.unigui.backend.minecraft_impl.MinecraftTextureHandle;
 import dev.sixik.unigui.backend.minecraft_impl.MinecraftWidgetScreen;
+import dev.sixik.unigui.backend.minecraft_impl.UniGuiTextures;
 import dev.sixik.unigui.impl.core.DefaultUIContext;
 import dev.sixik.unigui.widgets.containers.VBox;
 import dev.sixik.unigui.widgets.display.Label;
+import dev.sixik.unigui.widgets.feedback.OverlayLayer;
+import dev.sixik.unigui.widgets.feedback.Tooltip;
 import dev.sixik.unigui.widgets.interaction.Button;
 import dev.sixik.unigui.widgets.world.WorldCanvas;
 import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
@@ -28,18 +38,49 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientChunkCache;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ChunkMap;
+import net.minecraft.server.level.ChunkResult;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.MapColor;
 
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public class TestMap {
+
+    private static final MutableColor COLOR_WHITE = new MutableColor(1.0f, 1.0f, 1.0f, 1.0f);
+    private static final TextureHandle ICON_NODE_TOWN = new MinecraftTextureHandle(
+            ResourceLocation.fromNamespaceAndPath("artisans_delight", "textures/gui/icon_node_town.png"), 124, 140);
+    private static final TextureHandle ICON_NODE_KNOT = new MinecraftTextureHandle(
+            ResourceLocation.fromNamespaceAndPath("artisans_delight", "textures/gui/icon_node_knot.png"), 124, 140);
+
+    private static final int MAX_CHUNK_BAKES_PER_FRAME = 24;
+    private static final float LOD_SWITCH_ZOOM = 0.12f;
+
+    private static final int REGION_CHUNK_SIZE = 16; // 16x16 chunks = 256x256 blocks (LOD 0)
+    private static final int MACRO_CHUNK_SIZE = 64;  // 64x64 chunks = 1024x1024 blocks (LOD 1)
+
+    // Хранилище исследованных чанков и LOD-регионов в памяти без лимита на вытеснение
+    private static final LongSet BAKED_CHUNKS = new LongOpenHashSet();
+    private static final Map<Long, RegionTile> REGIONS_LOD0 = new HashMap<>();
+    private static final Map<Long, RegionTile> REGIONS_LOD1 = new HashMap<>();
+
+    private static ResourceKey<Level> lastDimension = null;
 
     private static Field serverVisibleChunkMapField;
     private static Field clientStorageField;
@@ -49,6 +90,20 @@ public class TestMap {
     private static long lastChunkQueryTime = 0;
     private static LongSet cachedLoadedChunks = new LongOpenHashSet();
 
+    public static void clearTextureCache() {
+        for (RegionTile r : REGIONS_LOD0.values()) {
+            r.close();
+        }
+        REGIONS_LOD0.clear();
+
+        for (RegionTile r : REGIONS_LOD1.values()) {
+            r.close();
+        }
+        REGIONS_LOD1.clear();
+
+        BAKED_CHUNKS.clear();
+    }
+
     public static void openMap() {
         openMap(null, null);
     }
@@ -56,6 +111,16 @@ public class TestMap {
     public static void openMap(WorldObjectManager manager, Collection<WorldObject> knots) {
         Minecraft minecraft = Minecraft.getInstance();
         Screen previous = minecraft.screen;
+
+        if (minecraft.level != null) {
+            ResourceKey<Level> currentDim = minecraft.level.dimension();
+            if (lastDimension != null && !lastDimension.equals(currentDim)) {
+                clearTextureCache();
+            }
+            lastDimension = currentDim;
+        } else {
+            clearTextureCache();
+        }
 
         // Тестовый режим: если узлы не переданы или пусты, дёргаем сервер напрямую (singleplayer)
         if ((knots == null || knots.isEmpty()) && minecraft.level != null) {
@@ -77,13 +142,13 @@ public class TestMap {
         }
 
         DefaultUIContext context = new DefaultUIContext(new MinecraftClipboardService());
-        context.debugFlags(DebugFlags.PROFILER_OVERLAY);
         UnityLikeUIScaleProvider scale = new UnityLikeUIScaleProvider()
                 .referenceResolution(1920.0f, 1080.0f)
                 .matchBalanced()
                 .scaleRange(0.75f, 6.0f)
                 .userScale(2.15f);
         context.scaleProvider(scale);
+        context.debugFlags(DebugFlags.PROFILER_OVERLAY);
 
         MinecraftWidgetScreen screen = new MinecraftWidgetScreen(
                 Component.literal("Artisans Delight - World Map"),
@@ -145,13 +210,14 @@ public class TestMap {
         canvas.layout(style -> style.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).flexGrow(1.0f).flexShrink(1.0f));
 
         Label status = new Label(String.format(Locale.ROOT,
-                "WorldCanvas: knots loaded: %d | Drag empty space, Wheel zoom, Click markers to inspect/invest", knotList.size()));
+                "WorldCanvas: knots: %d | Explored: %d chunks | Drag empty space, Wheel zoom, Click markers to inspect/invest",
+                knotList.size(), BAKED_CHUNKS.size()));
         status.layout(style -> style.size(LayoutConstraints.AUTO, 22.0f).flexGrow(0.0f).flexShrink(0.0f));
 
         // Вычисляем псевдо-соединения между узлами (KNN / Proximity Graph)
         List<PseudoEdge> pseudoEdges = buildPseudoEdges(knotList);
 
-        // Фоновый и графический слой карты (сетка, чанки, границы чанков, псевдо-связи, дороги, узлы, игрок)
+        // Фоновый и графический слой карты (рельеф мира, сетка, чанки, границы чанков, псевдо-связи, дороги, узлы, игрок)
         canvas.addWorldLayer((world, draw) -> {
             float left = world.layoutBounds().x();
             float top = world.layoutBounds().y();
@@ -167,33 +233,78 @@ public class TestMap {
             float maxWorldY = world.rootToWorldY(top + height);
             float zoom = world.viewport().zoom();
 
-            // === 1. ЗОНА ЗАГРУЖЕННЫХ ЧАНКОВ И ДИНАМИЧЕСКАЯ ГРАНИЦА ===
+            // === 1. ВАНИЛЬНЫЙ РЕЛЬЕФ МИРА С СИСТЕМОЙ LOD (LOD 0: 256x256 блоков, LOD 1: 1024x1024 блоков) ===
             LongSet loadedChunks = getLoadedChunks();
-            if (!loadedChunks.isEmpty()) {
-                // Подсветка исследованной/загруженной территории (если зум не слишком далёкий)
-                if (zoom >= 0.08f) {
-                    MutableColor chunkTint = new MutableColor(0.065f, 0.14f, 0.25f, 0.22f);
-                    for (long packed : loadedChunks) {
+            int bakedThisFrame = 0;
+
+            if (minecraft.level != null && !loadedChunks.isEmpty()) {
+                for (long packed : loadedChunks) {
+                    if (BAKED_CHUNKS.contains(packed)) {
+                        continue;
+                    }
+                    if (bakedThisFrame >= MAX_CHUNK_BAKES_PER_FRAME) {
+                        break;
+                    }
+                    int cx = ChunkPos.getX(packed);
+                    int cz = ChunkPos.getZ(packed);
+                    LevelChunk chunk = getLoadedLevelChunk(minecraft, cx, cz);
+                    if (chunk != null && !chunk.isEmpty()) {
+                        bakeChunkToRegions(minecraft, chunk, cx, cz);
+                        BAKED_CHUNKS.add(packed);
+                        bakedThisFrame++;
+                    }
+                }
+            }
+
+            // Подложка для чанков в зоне загрузки, которые ещё ждут своей очереди запекания
+            if (minecraft.level != null && !loadedChunks.isEmpty()) {
+                MutableColor placeholderTint = new MutableColor(0.065f, 0.14f, 0.25f, 0.22f);
+                for (long packed : loadedChunks) {
+                    if (!BAKED_CHUNKS.contains(packed)) {
                         int cx = ChunkPos.getX(packed);
                         int cz = ChunkPos.getZ(packed);
                         float bx0 = cx * 16.0f;
-                        float bx1 = bx0 + 16.0f;
                         float bz0 = cz * 16.0f;
+                        float bx1 = bx0 + 16.0f;
                         float bz1 = bz0 + 16.0f;
-
                         if (bx1 < minWorldX || bx0 > maxWorldX || bz1 < minWorldY || bz0 > maxWorldY) {
                             continue;
                         }
-
-                        float sx = world.worldToRootX(bx0);
-                        float sy = world.worldToRootY(bz0);
-                        float sw = 16.0f * zoom;
-                        float sh = 16.0f * zoom;
-                        draw.addRectFilled(sx, sy, sw, sh, chunkTint);
+                        float sx0 = world.worldToRootX(bx0);
+                        float sy0 = world.worldToRootY(bz0);
+                        float sx1 = world.worldToRootX(bx1);
+                        float sy1 = world.worldToRootY(bz1);
+                        draw.addRectFilled(sx0, sy0, sx1 - sx0, sy1 - sy0, placeholderTint);
                     }
                 }
+            }
 
-                // Граница загруженных чанков (рисуется только на стыке с незагруженными чанками)
+            // Отрисовка активных LOD-регионов (LOD 0 для зума >= 0.12f, LOD 1 для зума < 0.12f)
+            boolean useLod1 = zoom < LOD_SWITCH_ZOOM;
+            Map<Long, RegionTile> activeRegions = useLod1 ? REGIONS_LOD1 : REGIONS_LOD0;
+
+            for (RegionTile tile : activeRegions.values()) {
+                // Фрустум-куллинг на уровне регионов
+                if (tile.maxWorldX < minWorldX || tile.minWorldX > maxWorldX ||
+                        tile.maxWorldZ < minWorldY || tile.minWorldZ > maxWorldY) {
+                    continue;
+                }
+
+                tile.updateTextureIfNeeded();
+                if (tile.handle != null) {
+                    float sx0 = world.worldToRootX(tile.minWorldX);
+                    float sy0 = world.worldToRootY(tile.minWorldZ);
+                    float sx1 = world.worldToRootX(tile.maxWorldX);
+                    float sy1 = world.worldToRootY(tile.maxWorldZ);
+                    float sw = sx1 - sx0;
+                    float sh = sy1 - sy0;
+
+                    draw.addImage(tile.handle, sx0, sy0, sw, sh, COLOR_WHITE);
+                }
+            }
+
+            // === 2. ДИНАМИЧЕСКАЯ ГРАНИЦА ЗАГРУЖЕННЫХ ЧАНКОВ (ФРОНТИР) ===
+            if (!loadedChunks.isEmpty()) {
                 MutableColor glowColor = new MutableColor(0.15f, 0.65f, 1.0f, 0.35f);
                 MutableColor borderColor = new MutableColor(0.35f, 0.90f, 1.0f, 0.90f);
 
@@ -244,7 +355,7 @@ public class TestMap {
                 }
             }
 
-            // === 2. АДАПТИВНАЯ КООРДИНАТНАЯ СЕТКА ===
+            // === 3. АДАПТИВНАЯ КООРДИНАТНАЯ СЕТКА ===
             float step = 100.0f;
             if (zoom < 0.15f) step = 1000.0f;
             else if (zoom < 0.45f) step = 500.0f;
@@ -255,7 +366,7 @@ public class TestMap {
             float startY = (float) (Math.floor(Math.min(minWorldY, maxWorldY) / step) * step);
             float endY = (float) (Math.ceil(Math.max(minWorldY, maxWorldY) / step) * step);
 
-            MutableColor gridColor = new MutableColor(0.18f, 0.25f, 0.36f, 0.25f);
+            MutableColor gridColor = new MutableColor(0.18f, 0.25f, 0.36f, 0.20f);
             for (float x = startX; x <= endX; x += step) {
                 float sx = world.worldToRootX(x);
                 draw.addLine(sx, top, sx, top + height, gridColor, 1.0f);
@@ -279,7 +390,7 @@ public class TestMap {
                 investedMap.put(m.uuid.get(), inv);
             }
 
-            // === 3. РЕАЛЬНЫЕ ДОРОЖНЫЕ СВЯЗИ (neighbors) ===
+            // === 4. РЕАЛЬНЫЕ ДОРОЖНЫЕ СВЯЗИ (neighbors) ===
             Set<String> drawnEdges = new HashSet<>();
             for (WorldObject obj : knotList) {
                 Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
@@ -316,12 +427,11 @@ public class TestMap {
                 }
             }
 
-            // === 4. ПСЕВДО-ЛИНИИ СОЕДИНЕНИЙ (ДЛЯ ТЕСТА И ПЛАНИРОВАНИЯ МАРШРУТОВ) ===
+            // === 5. ПСЕВДО-ЛИНИИ СОЕДИНЕНИЙ (ДЛЯ ТЕСТА И ПЛАНИРОВАНИЯ МАРШРУТОВ) ===
             MutableColor pseudoColor = new MutableColor(0.45f, 0.65f, 0.85f, 0.40f);
             MutableColor pseudoPointColor = new MutableColor(0.45f, 0.65f, 0.85f, 0.60f);
 
             for (PseudoEdge edge : pseudoEdges) {
-                // Если между узлами уже есть реальная связь, псевдо-линию пропускаем
                 if (drawnEdges.contains(edge.key())) continue;
 
                 float x1 = world.worldToRootX((float) edge.posA.getX());
@@ -329,16 +439,16 @@ public class TestMap {
                 float x2 = world.worldToRootX((float) edge.posB.getX());
                 float y2 = world.worldToRootY((float) edge.posB.getZ());
 
-                // Рисуем пунктирную псевдо-линию
+                // Пунктирная псевдо-линия
                 drawDashedLine(draw, x1, y1, x2, y2, pseudoColor, 1.8f, 10.0f, 6.0f);
 
-                // Точка на середине пути для визуального ритма
+                // Точка на середине пути
                 float mx = (x1 + x2) * 0.5f;
                 float my = (y1 + y2) * 0.5f;
                 draw.addCircleFilled(mx, my, 3.0f, pseudoPointColor, 8);
             }
 
-            // === 5. ОРЕОЛЫ И МАРКЕРЫ УЗЛОВ ===
+            // === 6. ОРЕОЛЫ И МАРКЕРЫ УЗЛОВ ===
             for (WorldObject obj : knotList) {
                 KnotMetaComponent m = obj.getSingle(KnotMetaComponent.class).get();
                 BlockPos pos = m.pos.get();
@@ -350,16 +460,17 @@ public class TestMap {
 
                 KnotType kType = m.type.get();
                 MutableColor haloColor = inv
-                        ? new MutableColor(1.0f, 0.82f, 0.22f, 0.55f)
+                        ? new MutableColor(1.0f, 0.82f, 0.22f, 0.65f)
                         : (kType == KnotType.TOWN
                             ? new MutableColor(0.25f, 0.55f, 0.95f, 0.55f)
                             : new MutableColor(0.35f, 0.80f, 0.45f, 0.55f));
 
-                draw.addCircleFilled(kx, ky, 10.0f, haloColor, 16);
-                draw.addCircle(kx, ky, 14.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.40f), 16, 1.5f);
+                // Круг-основание под кончиком метки на карте
+                draw.addCircleFilled(kx, ky, 7.0f, haloColor, 16);
+                draw.addCircle(kx, ky, 10.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.50f), 16, 1.5f);
             }
 
-            // === 6. МАРКЕР ИГРОКА ===
+            // === 7. МАРКЕР ИГРОКА ===
             if (minecraft.player != null) {
                 float px = (float) minecraft.player.getX();
                 float pz = (float) minecraft.player.getZ();
@@ -371,7 +482,17 @@ public class TestMap {
             }
         });
 
-        // Создаем интерактивные якоря (виджеты) для каждого узла
+        // Собираем в вертикальный контейнер: холст сверху, статус-бар снизу
+        VBox rootBox = new VBox();
+        rootBox.layout(style -> style.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).flexGrow(1.0f).flexShrink(1.0f));
+        rootBox.addChild(canvas);
+        rootBox.addChild(status);
+
+        // OverlayLayer для размещения всплывающих подсказок (Tooltips) поверх холста
+        OverlayLayer rootOverlay = new OverlayLayer(rootBox);
+        rootOverlay.layout(style -> style.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).flexGrow(1.0f).flexShrink(1.0f));
+
+        // Создаем интерактивные якоря (иконка узла с тултипом) для каждого узла
         for (WorldObject knot : knotList) {
             KnotMetaComponent meta = knot.getSingle(KnotMetaComponent.class).get();
             BlockPos pos = meta.pos.get();
@@ -385,17 +506,39 @@ public class TestMap {
             Optional<KnotConnectionComponent> connOpt = knot.getSingle(KnotConnectionComponent.class);
             Optional<KnotProductionComponent> prodOpt = knot.getSingle(KnotProductionComponent.class);
 
-            String iconPrefix = switch (type) {
-                case TOWN -> "🏛 ";
-                case PRODUCTION -> "⛏ ";
-                case WAYPOINT -> "⚓ ";
-                case OUTPOST -> "⚔ ";
-                case PORTAL -> "🌀 ";
-                default -> "📍 ";
-            };
+            TextureHandle icon = (type == KnotType.TOWN) ? ICON_NODE_TOWN : ICON_NODE_KNOT;
 
-            String btnTitle = iconPrefix + name;
-            Button marker = new Button(btnTitle);
+            Button marker = new Button("");
+            marker.renderer((draw, w) -> {
+                dev.sixik.unigui.api.math.RectView b = w.layoutBounds();
+                float x = b.x();
+                float y = b.y();
+                float w0 = b.width();
+                float h0 = b.height();
+
+                boolean hovered = marker.hovered();
+                if (hovered) {
+                    // Подсветка/свечение при наведении курсора на иконку
+                    draw.addCircleFilled(x + w0 * 0.5f, y + h0 * 0.45f, w0 * 0.55f,
+                            new MutableColor(1.0f, 0.90f, 0.40f, 0.35f), 16);
+                    draw.addImage(icon, x - 1.0f, y - 2.0f, w0 + 2.0f, h0 + 2.0f,
+                            new MutableColor(1.0f, 1.0f, 0.85f, 1.0f));
+                } else {
+                    draw.addImage(icon, x, y, w0, h0, COLOR_WHITE);
+                }
+            });
+
+            Tooltip tooltip = new Tooltip(marker, buildNodeTooltip(meta, connOpt, prodOpt));
+            tooltip.background().set(0.08f, 0.09f, 0.12f, 0.95f);
+            tooltip.borderColor().set(0.85f, 0.70f, 0.25f, 0.90f);
+            tooltip.radius(4.0f);
+            tooltip.borderWidth(1.2f);
+            tooltip.offset(4.0f, 6.0f);
+            tooltip.maxWidth(260.0f);
+
+            marker.on(PointerEnteredEvent.TYPE, event -> {
+                tooltip.invalidate(InvalidationFlags.LAYOUT | InvalidationFlags.VISUAL);
+            });
 
             marker.onClick(event -> {
                 // В тестовом режиме: клик переключает инвестицию в узел (isInvested)
@@ -411,30 +554,333 @@ public class TestMap {
                         type, name, pos.getX(), pos.getY(), pos.getZ(),
                         currentInvested ? "YES" : "NO", cost, subNodesCount, neighborsCount
                 ));
+
+                // Обновляем текст тултипа в реальном времени при клике
+                tooltip.richText(buildNodeTooltip(meta, connOpt, prodOpt));
             });
 
-            float btnW = Math.max(90.0f, btnTitle.length() * 8.0f + 18.0f);
-            float btnH = 26.0f;
+            float pinW = 32.0f;
+            float pinH = 36.0f;
             canvas.anchorLayer().add("knot_" + knotId, worldX, worldY, marker)
-                    .screenSize(btnW, btnH)
-                    .pivot(0.5f, 0.5f);
+                    .screenSize(pinW, pinH)
+                    .pivot(0.5f, 1.0f);
+
+            rootOverlay.addOverlay(tooltip);
         }
 
         canvas.onViewportChanged(event -> {
             float curWorldX = canvas.rootToWorldX(screenCenterX);
             float curWorldY = canvas.rootToWorldY(screenCenterY);
+            String lodStr = event.newZoom() < LOD_SWITCH_ZOOM ? "LOD 1 (Overview)" : "LOD 0 (Detail)";
             status.text(String.format(Locale.ROOT,
-                    "WorldCanvas: Center [%.0f, %.0f] | Zoom %.2fx | Knots: %d | Loaded Chunks: %d",
-                    curWorldX, curWorldY, event.newZoom(), knotList.size(), cachedLoadedChunks.size()));
+                    "WorldCanvas: Center [%.0f, %.0f] | Zoom %.2fx | Knots: %d | Explored: %d chunks (%s) | Loaded: %d chunks",
+                    curWorldX, curWorldY, event.newZoom(), knotList.size(), BAKED_CHUNKS.size(), lodStr, cachedLoadedChunks.size()));
         });
 
-        // Собираем в вертикальный контейнер: холст сверху, статус-бар снизу
-        VBox rootBox = new VBox();
-        rootBox.layout(style -> style.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).flexGrow(1.0f).flexShrink(1.0f));
-        rootBox.addChild(canvas);
-        rootBox.addChild(status);
+        return rootOverlay;
+    }
 
-        return rootBox;
+    /**
+     * Формирует форматированный rich-текст для всплывающей подсказки узла/деревни.
+     */
+    private static RichText buildNodeTooltip(
+            KnotMetaComponent meta,
+            Optional<KnotConnectionComponent> connOpt,
+            Optional<KnotProductionComponent> prodOpt) {
+        BlockPos pos = meta.pos.get();
+        String name = meta.name.get();
+        KnotType type = meta.type.get();
+        boolean invested = connOpt.map(c -> c.isInvested.get()).orElse(false);
+        int cost = connOpt.map(c -> c.investmentCost.get()).orElse(0);
+        int neighborsCount = connOpt.map(c -> c.neighbors.get().size()).orElse(0);
+
+        String typeName = switch (type) {
+            case TOWN -> "Town";
+            case PRODUCTION -> "Production";
+            case WAYPOINT -> "Waypoint";
+            case OUTPOST -> "Outpost";
+            case PORTAL -> "Portal";
+            default -> "Node";
+        };
+
+        RichText.Builder builder = RichText.builder();
+        // Название узла (золотой цвет)
+        builder.color(new MutableColor(1.0f, 0.85f, 0.20f, 1.0f))
+               .append(name + "\n");
+
+        // Позиция узла (светло-серый)
+        builder.color(new MutableColor(0.80f, 0.82f, 0.85f, 1.0f))
+               .append(String.format(Locale.ROOT, "Pos: [%d, %d, %d]\n", pos.getX(), pos.getY(), pos.getZ()));
+
+        // Тип узла (бирюзовый/голубой)
+        builder.color(new MutableColor(0.40f, 0.75f, 1.0f, 1.0f))
+               .append("Type: " + typeName + "\n");
+
+        // Статус инвестиции (зеленый / оранжевый)
+        if (invested) {
+            builder.color(new MutableColor(0.35f, 0.95f, 0.45f, 1.0f))
+                   .append("Status: Invested\n");
+        } else {
+            builder.color(new MutableColor(1.0f, 0.60f, 0.30f, 1.0f))
+                   .append("Status: Not Invested (Cost: " + cost + " CP)\n");
+        }
+
+        if (neighborsCount > 0) {
+            builder.color(new MutableColor(0.70f, 0.70f, 0.70f, 1.0f))
+                   .append("Connections: " + neighborsCount + "\n");
+        }
+
+        // Подсказка действия
+        builder.color(new MutableColor(0.50f, 0.55f, 0.60f, 1.0f))
+               .append("Click to toggle investment");
+
+        return builder.build();
+    }
+
+    /**
+     * Класс тайла региона карты с поддержкой системы уровней детализации (LOD).
+     */
+    private static final class RegionTile {
+        final int tileX;
+        final int tileZ;
+        final int lod; // 0 для LOD 0 (16x16 чанков, 256x256 блоков), 1 для LOD 1 (64x64 чанков, 1024x1024 блоков)
+        final float minWorldX;
+        final float minWorldZ;
+        final float maxWorldX;
+        final float maxWorldZ;
+        final String texId;
+        final int[] pixels; // 256 * 256 RGBA цветов
+        TextureHandle handle;
+        boolean dirty;
+        int bakedChunkCount;
+
+        RegionTile(int tileX, int tileZ, int lod) {
+            this.tileX = tileX;
+            this.tileZ = tileZ;
+            this.lod = lod;
+            float blockSize = (lod == 0) ? (REGION_CHUNK_SIZE * 16.0f) : (MACRO_CHUNK_SIZE * 16.0f);
+            this.minWorldX = tileX * blockSize;
+            this.minWorldZ = tileZ * blockSize;
+            this.maxWorldX = this.minWorldX + blockSize;
+            this.maxWorldZ = this.minWorldZ + blockSize;
+
+            String xStr = tileX < 0 ? "n" + (-tileX) : "p" + tileX;
+            String zStr = tileZ < 0 ? "n" + (-tileZ) : "p" + tileZ;
+            this.texId = "artisans_delight:map_lod" + lod + "_" + xStr + "_" + zStr;
+            this.pixels = new int[256 * 256];
+            this.dirty = false;
+            this.bakedChunkCount = 0;
+        }
+
+        void updateTextureIfNeeded() {
+            if (!dirty) return;
+            dirty = false;
+
+            NativeImage image = new NativeImage(NativeImage.Format.RGBA, 256, 256, false);
+            for (int y = 0; y < 256; y++) {
+                int rowOffset = y * 256;
+                for (int x = 0; x < 256; x++) {
+                    image.setPixelRGBA(x, y, pixels[rowOffset + x]);
+                }
+            }
+            handle = UniGuiTextures.replace(texId, image, TextureOptions.nearest());
+        }
+
+        void close() {
+            if (handle != null) {
+                UniGuiTextures.unregister(texId);
+                handle = null;
+            }
+            dirty = false;
+            bakedChunkCount = 0;
+        }
+    }
+
+    /**
+     * Запекание чанка сразу во все активные слои системы LOD (LOD 0 и LOD 1).
+     */
+    private static void bakeChunkToRegions(Minecraft mc, LevelChunk chunk, int cx, int cz) {
+        int[] chunkPixels = new int[256];
+        if (!sampleChunkPixels(mc, chunk, cx, cz, chunkPixels)) {
+            return;
+        }
+
+        // 1. LOD 0: Регион 16x16 чанков (256x256 блоков, 1 блок = 1 пиксель)
+        int rx = Math.floorDiv(cx, REGION_CHUNK_SIZE);
+        int rz = Math.floorDiv(cz, REGION_CHUNK_SIZE);
+        long rKey = ChunkPos.asLong(rx, rz);
+
+        RegionTile region = REGIONS_LOD0.computeIfAbsent(rKey, k -> new RegionTile(rx, rz, 0));
+        int relChunkX = cx - rx * REGION_CHUNK_SIZE;
+        int relChunkZ = cz - rz * REGION_CHUNK_SIZE;
+        int px0 = relChunkX * 16;
+        int pz0 = relChunkZ * 16;
+
+        for (int lz = 0; lz < 16; lz++) {
+            int rowOffset = (pz0 + lz) * 256 + px0;
+            for (int lx = 0; lx < 16; lx++) {
+                region.pixels[rowOffset + lx] = chunkPixels[lz * 16 + lx];
+            }
+        }
+        region.dirty = true;
+        region.bakedChunkCount++;
+
+        // 2. LOD 1: Макро-регион 64x64 чанков (1024x1024 блоков, 1 пиксель = 4x4 блока)
+        int mx = Math.floorDiv(cx, MACRO_CHUNK_SIZE);
+        int mz = Math.floorDiv(cz, MACRO_CHUNK_SIZE);
+        long mKey = ChunkPos.asLong(mx, mz);
+
+        RegionTile macro = REGIONS_LOD1.computeIfAbsent(mKey, k -> new RegionTile(mx, mz, 1));
+        int mRelChunkX = cx - mx * MACRO_CHUNK_SIZE;
+        int mRelChunkZ = cz - mz * MACRO_CHUNK_SIZE;
+        int mpx0 = mRelChunkX * 4;
+        int mpz0 = mRelChunkZ * 4;
+
+        // Даунскейл 16x16 чанка в 4x4 макро-пикселя
+        for (int my = 0; my < 4; my++) {
+            int macroRowOffset = (mpz0 + my) * 256 + mpx0;
+            for (int mxPix = 0; mxPix < 4; mxPix++) {
+                int sampleColor = chunkPixels[(my * 4 + 2) * 16 + (mxPix * 4 + 2)];
+                macro.pixels[macroRowOffset + mxPix] = sampleColor;
+            }
+        }
+        macro.dirty = true;
+        macro.bakedChunkCount++;
+    }
+
+    /**
+     * Сэмплирование цветов и высот чанка по точной ванильной формуле 3D-рельефа.
+     */
+    private static boolean sampleChunkPixels(Minecraft mc, LevelChunk chunk, int cx, int cz, int[] outPixels) {
+        if (chunk == null || chunk.isEmpty()) return false;
+
+        try {
+            BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+            BlockPos.MutableBlockPos fluidPos = new BlockPos.MutableBlockPos();
+
+            Level level = chunk.getLevel() != null ? chunk.getLevel() : mc.level;
+            int minBuildHeight = level != null ? level.getMinBuildHeight() : chunk.getMinBuildHeight();
+
+            // Высоты северных соседей (строка z=15 чанка cz-1) для бесшовного затенения на стыке
+            int[] lastHeights = new int[16];
+            LevelChunk northChunk = getLoadedLevelChunk(mc, cx, cz - 1);
+            for (int lx = 0; lx < 16; lx++) {
+                if (northChunk != null && !northChunk.isEmpty()) {
+                    lastHeights[lx] = northChunk.getHeight(Heightmap.Types.WORLD_SURFACE, lx, 15);
+                } else {
+                    lastHeights[lx] = -1;
+                }
+            }
+
+            for (int lz = 0; lz < 16; lz++) {
+                for (int lx = 0; lx < 16; lx++) {
+                    int worldX = (cx << 4) + lx;
+                    int worldZ = (cz << 4) + lz;
+
+                    int k = chunk.getHeight(Heightmap.Types.WORLD_SURFACE, lx, lz) + 1;
+                    BlockState blockstate;
+                    int waterDepth = 0;
+
+                    if (k <= minBuildHeight + 1) {
+                        blockstate = Blocks.BEDROCK.defaultBlockState();
+                    } else {
+                        pos.set(worldX, k, worldZ);
+                        do {
+                            pos.setY(--k);
+                            blockstate = chunk.getBlockState(pos);
+                        } while (blockstate.getMapColor(chunk, pos) == MapColor.NONE && k > minBuildHeight);
+
+                        FluidState fluidState = blockstate.getFluidState();
+                        if (k > minBuildHeight && !fluidState.isEmpty()) {
+                            int fluidY = k - 1;
+                            fluidPos.set(worldX, fluidY, worldZ);
+                            BlockState subState;
+                            do {
+                                fluidPos.setY(fluidY--);
+                                subState = chunk.getBlockState(fluidPos);
+                                waterDepth++;
+                            } while (fluidY > minBuildHeight && !subState.getFluidState().isEmpty());
+
+                            if (!blockstate.isFaceSturdy(chunk, pos, Direction.UP)) {
+                                blockstate = fluidState.createLegacyBlock();
+                            }
+                        }
+                    }
+
+                    MapColor mapColor = blockstate.getMapColor(chunk, pos);
+                    if (mapColor == MapColor.NONE) {
+                        mapColor = MapColor.DIRT;
+                    }
+
+                    int northY = lastHeights[lx] >= 0 ? lastHeights[lx] : k;
+                    lastHeights[lx] = k;
+
+                    MapColor.Brightness brightness;
+                    if (mapColor == MapColor.WATER) {
+                        double d2 = (double) waterDepth * 0.1 + (double) ((worldX + worldZ) & 1) * 0.2;
+                        if (d2 < 0.5) {
+                            brightness = MapColor.Brightness.HIGH;
+                        } else if (d2 > 0.9) {
+                            brightness = MapColor.Brightness.LOW;
+                        } else {
+                            brightness = MapColor.Brightness.NORMAL;
+                        }
+                    } else {
+                        double diff = (double) (k - northY);
+                        double d3 = diff * 0.8 + ((double) ((worldX + worldZ) & 1) - 0.5) * 0.4;
+                        if (d3 > 0.6) {
+                            brightness = MapColor.Brightness.HIGH;
+                        } else if (d3 < -0.6) {
+                            brightness = MapColor.Brightness.LOW;
+                        } else {
+                            brightness = MapColor.Brightness.NORMAL;
+                        }
+                    }
+
+                    int pixel = mapColor.calculateRGBColor(brightness);
+                    outPixels[lz * 16 + lx] = pixel;
+                }
+            }
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static LevelChunk getLoadedLevelChunk(Minecraft mc, int cx, int cz) {
+        if (mc.level == null) return null;
+
+        // 1. Клиентский уровень (Render thread safe)
+        LevelChunk clientChunk = mc.level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
+        if (clientChunk != null) {
+            return clientChunk;
+        }
+
+        // 2. Интегрированный сервер в singleplayer (для чанков за пределами клиентского рендера)
+        if (mc.getSingleplayerServer() != null) {
+            try {
+                initReflection();
+                ServerLevel sLevel = mc.getSingleplayerServer().getLevel(mc.level.dimension());
+                if (sLevel != null && serverVisibleChunkMapField != null) {
+                    ChunkMap map = sLevel.getChunkSource().chunkMap;
+                    Long2ObjectLinkedOpenHashMap<?> holders = (Long2ObjectLinkedOpenHashMap<?>) serverVisibleChunkMapField.get(map);
+                    if (holders != null) {
+                        Object val = holders.get(ChunkPos.asLong(cx, cz));
+                        if (val instanceof ChunkHolder holder) {
+                            LevelChunk chunk = holder.getTickingChunk();
+                            if (chunk != null) return chunk;
+                            ChunkResult<LevelChunk> result = holder.getFullChunkFuture().getNow(ChunkHolder.UNLOADED_LEVEL_CHUNK);
+                            if (result != null && result.isSuccess()) {
+                                return result.orElse(null);
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -561,10 +1007,6 @@ public class TestMap {
                                 set.add(holder.getPos().toLong());
                             }
                         }
-                        if (!set.isEmpty()) {
-                            cachedLoadedChunks = set;
-                            return set;
-                        }
                     }
                 }
             } catch (Throwable ignored) {
@@ -585,10 +1027,6 @@ public class TestMap {
                                 set.add(chunk.getPos().toLong());
                             }
                         }
-                        if (!set.isEmpty()) {
-                            cachedLoadedChunks = set;
-                            return set;
-                        }
                     }
                 }
             } catch (Throwable ignored) {
@@ -596,7 +1034,7 @@ public class TestMap {
         }
 
         // 3. Запасной вариант: опрос чанков вокруг игрока через публичный hasChunk
-        if (mc.level != null && mc.player != null) {
+        if (set.isEmpty() && mc.level != null && mc.player != null) {
             int pcx = (int) Math.floor(mc.player.getX()) >> 4;
             int pcz = (int) Math.floor(mc.player.getZ()) >> 4;
             int radius = 16;
@@ -621,7 +1059,8 @@ public class TestMap {
 
         try {
             for (Field f : ChunkMap.class.getDeclaredFields()) {
-                if (Long2ObjectLinkedOpenHashMap.class.isAssignableFrom(f.getType())) {
+                if (f.getName().equals("visibleChunkMap") ||
+                        (Long2ObjectLinkedOpenHashMap.class.isAssignableFrom(f.getType()) && (f.getModifiers() & java.lang.reflect.Modifier.VOLATILE) != 0)) {
                     f.setAccessible(true);
                     serverVisibleChunkMapField = f;
                     break;
