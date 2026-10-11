@@ -14,6 +14,7 @@ import dev.sixik.unigui.api.debug.DebugFlags;
 import dev.sixik.unigui.api.event.Event;
 import dev.sixik.unigui.api.event.PointerEnteredEvent;
 import dev.sixik.unigui.api.event.PointerMovedEvent;
+import dev.sixik.unigui.api.event.PointerPressedEvent;
 import dev.sixik.unigui.api.event.ScrollEvent;
 import dev.sixik.unigui.api.layout.Align;
 import dev.sixik.unigui.api.layout.EdgeInsets;
@@ -55,6 +56,10 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientChunkCache;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import dev.sixik.unigui.widgets.minecraft.MinecraftItemPreviewWidget;
+import dev.sixik.unigui.widgets.minecraft.MinecraftItemTooltip;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
@@ -101,9 +106,14 @@ public class TestMap {
     private static VBox activeLeftContent;
     private static Box activeSearchPanel;
     private static OverlayLayer activeUiLayer;
+    private static OverlayLayer activeRootOverlay;
     private static WindowWidget activeHouseWindow;
+    private static WindowWidget activeStorageWindow;
     private static final Map<UUID, List<TownHouseData>> TOWN_HOUSES = new HashMap<>();
     private static final Map<String, Tooltip> HOUSE_TOOLTIPS = new HashMap<>();
+    private static final Map<UUID, TownStorageData> TOWN_STORAGES = new HashMap<>();
+    private static final List<Tooltip> STORAGE_TOOLTIPS = new ArrayList<>();
+    private static final int TOTAL_STORAGE_SLOTS = 56;
 
     // Сохраненный вьюпорт до перехода в режим города для точного возврата
     private static float savedViewportX = 0.0f;
@@ -332,10 +342,14 @@ public class TestMap {
                     return true;
                 }
 
-                // 2. Escape: закрытие поиска -> закрытие окна рабочих -> закрытие окна дома -> выход из режима города -> закрытие карты
+                // 2. Escape: закрытие поиска -> закрытие окна склада -> закрытие окна рабочих -> закрытие окна дома -> выход из режима города -> закрытие карты
                 if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                     if (activeSearchPanel != null && activeSearchPanel.visible()) {
                         activeSearchPanel.visible(false);
+                        return true;
+                    }
+                    if (activeStorageWindow != null && activeStorageWindow.opened()) {
+                        activeStorageWindow.close();
                         return true;
                     }
                     if (activeWorkerWindow != null && activeWorkerWindow.opened()) {
@@ -710,6 +724,7 @@ public class TestMap {
         // Полноэкранный корневой оверлей, в котором поверх uiLayer отрисовываются ВСЕ всплывающие подсказки (Tooltips)
         OverlayLayer rootOverlay = new OverlayLayer(uiLayer);
         rootOverlay.layout(style -> style.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).flexGrow(1.0f).flexShrink(1.0f));
+        activeRootOverlay = rootOverlay;
 
         // 0. Верхняя компактная плашка BDO: Поиск (loupe.png) | Фильтр (filter.png) | Очки влияния N/MAX | Рабочие (pickaxe.png)
         Box topBadge = new Box();
@@ -1049,6 +1064,24 @@ public class TestMap {
         activeWorkerWindow.borderWidth(1.5f);
         activeWorkerWindow.close();
         uiLayer.addOverlay(activeWorkerWindow);
+
+        // 4. Движимое окно склада города (BDO Style)
+        activeStorageWindow = new WindowWidget();
+        activeStorageWindow.title("Склад города");
+        activeStorageWindow.minWindowSize(360.0f, 420.0f);
+        activeStorageWindow.layout(style -> style
+                .position(PositionType.ABSOLUTE)
+                .left(310.0f)
+                .top(28.0f)
+                .size(380.0f, 480.0f));
+        activeStorageWindow.background().set(0.06f, 0.07f, 0.10f, 0.96f);
+        activeStorageWindow.borderColor().set(0.85f, 0.70f, 0.25f, 0.90f);
+        activeStorageWindow.headerColor().set(0.10f, 0.13f, 0.18f, 0.98f);
+        activeStorageWindow.radius(6.0f);
+        activeStorageWindow.borderWidth(1.5f);
+        activeStorageWindow.onClosed(e -> clearStorageTooltips());
+        activeStorageWindow.close();
+        uiLayer.addOverlay(activeStorageWindow);
 
         // Выпадающая панель поиска добавляется последней в uiLayer, гарантируя Z-порядок выше панелей и окон
         uiLayer.addOverlay(activeSearchPanel);
@@ -1847,6 +1880,10 @@ public class TestMap {
         if (activeLeftPanel != null) {
             activeLeftPanel.visible(false);
         }
+        if (activeStorageWindow != null && activeStorageWindow.opened()) {
+            activeStorageWindow.close();
+            clearStorageTooltips();
+        }
         if (activeHouseWindow != null && activeHouseWindow.opened()) {
             activeHouseWindow.close();
         }
@@ -1994,11 +2031,27 @@ public class TestMap {
             }
         }
 
+        // Управление городом: склад (BDO Style)
+        TownStorageData townStorage = getOrCreateTownStorage(town);
+        int curUnlocked = townStorage != null ? townStorage.getUnlockedSlots(totalStorageSlots) : 16;
+
+        Label actionsTitle = new Label("─── Управление поселением ───");
+        actionsTitle.color(new MutableColor(0.85f, 0.70f, 0.30f, 0.90f));
+        activeLeftContent.addChild(actionsTitle);
+
+        Button storageBtn = new Button("📦 Склад города (" + curUnlocked + "/" + TOTAL_STORAGE_SLOTS + ")");
+        storageBtn.layout(s -> s.height(28.0f));
+        storageBtn.textColor(new MutableColor(1.0f, 0.88f, 0.35f, 1.0f));
+        storageBtn.onClick(e -> {
+            openTownStorageWindow(town, canvas, status);
+        });
+        activeLeftContent.addChild(storageBtn);
+
         Label statsTitle = new Label("─── Статистика города ───");
         statsTitle.color(new MutableColor(0.85f, 0.70f, 0.30f, 0.90f));
         activeLeftContent.addChild(statsTitle);
 
-        Label storageLabel = new Label("📦 Склад: +" + totalStorageSlots + " слотов");
+        Label storageLabel = new Label("📦 Склад: +" + totalStorageSlots + " слотов (от домов)");
         storageLabel.color(new MutableColor(0.85f, 0.88f, 0.92f, 1.0f));
         activeLeftContent.addChild(storageLabel);
 
@@ -2079,6 +2132,9 @@ public class TestMap {
                 updateHouseTooltip(house);
                 updateTownLeftPanel(town, canvas, status);
                 openHouseWindow(town, house, canvas, status);
+                if (activeStorageWindow != null && activeStorageWindow.opened()) {
+                    openTownStorageWindow(town, canvas, status);
+                }
                 if (status != null) {
                     status.text("Дом " + house.name + ": уровень установлен на " + targetLevel);
                 }
@@ -2111,6 +2167,9 @@ public class TestMap {
                     updateHouseTooltip(house);
                     updateTownLeftPanel(town, canvas, status);
                     openHouseWindow(town, house, canvas, status);
+                    if (activeStorageWindow != null && activeStorageWindow.opened()) {
+                        openTownStorageWindow(town, canvas, status);
+                    }
                     if (status != null) {
                         status.text("Дом " + house.name + ": назначение изменено на " + purpose.title);
                     }
@@ -2142,6 +2201,9 @@ public class TestMap {
                 total += h.level;
             }
         }
+        for (TownStorageData storage : TOWN_STORAGES.values()) {
+            total += (storage.extraPurchasedSlots / 8);
+        }
         return total;
     }
 
@@ -2166,6 +2228,11 @@ public class TestMap {
             }
         }
 
+        int storageUsed = 0;
+        for (TownStorageData storage : TOWN_STORAGES.values()) {
+            storageUsed += (storage.extraPurchasedSlots / 8);
+        }
+
         RichText.Builder b = RichText.builder();
         b.color(new MutableColor(1.0f, 0.85f, 0.25f, 1.0f))
          .append("✨ Очки влияния (CP)\n");
@@ -2177,6 +2244,10 @@ public class TestMap {
          .append("  • В узлы и города: " + nodeUsed + " ОВ\n");
         b.color(new MutableColor(0.70f, 0.75f, 0.80f, 1.0f))
          .append("  • В недвижимость (дома): " + houseUsed + " ОВ\n");
+        if (storageUsed > 0) {
+            b.color(new MutableColor(0.70f, 0.75f, 0.80f, 1.0f))
+             .append("  • В склады поселений: " + storageUsed + " ОВ\n");
+        }
         b.color(new MutableColor(0.50f, 0.55f, 0.60f, 1.0f))
          .append("Очки влияния требуются для инвестиций в узлы и улучшения зданий.");
         return b.build();
@@ -2475,5 +2546,343 @@ public class TestMap {
 
         activeWorkerWindow.content(winContent);
         activeWorkerWindow.open();
+    }
+
+    // =========================================================================
+    // === BDO TOWN STORAGE SYSTEM METHODS ===
+    // =========================================================================
+
+    public static final class TownStorageData {
+        public final UUID townId;
+        public final List<ItemStack> items = new ArrayList<>();
+        public int extraPurchasedSlots = 0;
+        public int silver = 25480;
+
+        public TownStorageData(UUID townId) {
+            this.townId = townId;
+            initDefaultItems();
+        }
+
+        private void initDefaultItems() {
+            items.add(new ItemStack(Items.IRON_INGOT, 48));
+            items.add(new ItemStack(Items.COPPER_INGOT, 64));
+            items.add(new ItemStack(Items.GOLD_INGOT, 18));
+            items.add(new ItemStack(Items.COAL, 64));
+            items.add(new ItemStack(Items.RAW_IRON, 32));
+            items.add(new ItemStack(Items.OAK_LOG, 64));
+            items.add(new ItemStack(Items.WHEAT, 54));
+            items.add(new ItemStack(Items.BREAD, 24));
+            items.add(new ItemStack(Items.DIAMOND, 4));
+            items.add(new ItemStack(Items.LEATHER, 20));
+            items.add(new ItemStack(Items.REDSTONE, 45));
+            items.add(new ItemStack(Items.EMERALD, 12));
+            items.add(new ItemStack(Items.IRON_PICKAXE, 1));
+            items.add(new ItemStack(Items.COOKED_BEEF, 16));
+        }
+
+        public int getUnlockedSlots(int houseBonus) {
+            int base = 16;
+            return Math.min(TOTAL_STORAGE_SLOTS, base + houseBonus + extraPurchasedSlots);
+        }
+
+        public int getFilledItemCount() {
+            int count = 0;
+            for (ItemStack s : items) {
+                if (s != null && !s.isEmpty()) count++;
+            }
+            return count;
+        }
+
+        public void sortItems() {
+            items.sort((a, b) -> {
+                boolean aEmpty = (a == null || a.isEmpty());
+                boolean bEmpty = (b == null || b.isEmpty());
+                if (aEmpty && bEmpty) return 0;
+                if (aEmpty) return 1;
+                if (bEmpty) return -1;
+                int nameCmp = a.getHoverName().getString().compareToIgnoreCase(b.getHoverName().getString());
+                if (nameCmp != 0) return nameCmp;
+                return Integer.compare(b.getCount(), a.getCount());
+            });
+        }
+    }
+
+    private static TownStorageData getOrCreateTownStorage(WorldObject town) {
+        if (town == null) return null;
+        return TOWN_STORAGES.computeIfAbsent(town.id(), TownStorageData::new);
+    }
+
+    private static void clearStorageTooltips() {
+        for (Tooltip t : STORAGE_TOOLTIPS) {
+            if (activeRootOverlay != null) {
+                activeRootOverlay.removeOverlay(t);
+            }
+        }
+        STORAGE_TOOLTIPS.clear();
+    }
+
+    private static void openTownStorageWindow(WorldObject town, WorldCanvas canvas, Label status) {
+        if (activeStorageWindow == null || town == null) return;
+
+        KnotMetaComponent townMeta = town.getSingle(KnotMetaComponent.class).orElse(null);
+        String townName = townMeta != null ? townMeta.name.get() : "Город";
+
+        activeStorageWindow.title("Склад: " + townName);
+
+        clearStorageTooltips();
+
+        TownStorageData storage = getOrCreateTownStorage(town);
+
+        List<TownHouseData> houses = getOrCreateTownHouses(town);
+        int houseStorageBonus = 0;
+        for (TownHouseData h : houses) {
+            if (h.purpose == HousePurpose.STORAGE) {
+                houseStorageBonus += h.level * 6;
+            }
+        }
+        int unlockedSlots = storage.getUnlockedSlots(houseStorageBonus);
+
+        VBox winContent = new VBox();
+        winContent.spacing(8.0f);
+        winContent.layout(s -> s.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO)
+                .flexGrow(1.0f).flexShrink(1.0f).padding(8.0f));
+
+        // 1. Верхняя информационная панель (статус хранилища, серебро, сортировка)
+        HBox topBar = new HBox();
+        topBar.spacing(6.0f);
+        topBar.layout(s -> s.height(26.0f).alignItems(Align.CENTER));
+
+        Label slotsInfo = new Label("Слоты: " + storage.getFilledItemCount() + " / " + unlockedSlots + " (Всего: " + TOTAL_STORAGE_SLOTS + ")");
+        slotsInfo.color(new MutableColor(0.85f, 0.88f, 0.92f, 1.0f));
+        slotsInfo.layout(s -> s.flexGrow(1.0f));
+        topBar.addChild(slotsInfo);
+
+        Label moneyLabel = new Label("🪙 " + String.format(Locale.ROOT, "%,d", storage.silver));
+        moneyLabel.color(new MutableColor(1.0f, 0.85f, 0.30f, 1.0f));
+        topBar.addChild(moneyLabel);
+
+        Button sortBtn = new Button("🔀 Сортировка");
+        sortBtn.layout(s -> s.height(24.0f).padding(1.0f, 6.0f, 1.0f, 6.0f));
+        sortBtn.onClick(e -> {
+            storage.sortItems();
+            openTownStorageWindow(town, canvas, status);
+            if (status != null) {
+                status.text("Склад города " + townName + " отсортирован 🔀");
+            }
+        });
+        topBar.addChild(sortBtn);
+
+        winContent.addChild(topBar);
+
+        // Полоса заполненности склада
+        Box progressBar = new Box();
+        progressBar.backgroundVisible(false);
+        progressBar.layout(s -> s.height(6.0f));
+        int filledCount = storage.getFilledItemCount();
+        progressBar.renderer((draw, w) -> {
+            RectView b = w.layoutBounds();
+            draw.addRectFilled(b.x(), b.y(), b.width(), b.height(), 2.0f, new MutableColor(0.04f, 0.05f, 0.08f, 0.95f));
+            float ratio = Math.clamp((float) filledCount / (float) Math.max(1, unlockedSlots), 0.0f, 1.0f);
+            if (ratio > 0.0f) {
+                MutableColor col = ratio > 0.85f ? new MutableColor(0.95f, 0.35f, 0.25f, 0.9f)
+                        : (ratio > 0.6f ? new MutableColor(0.95f, 0.75f, 0.20f, 0.9f)
+                        : new MutableColor(0.25f, 0.75f, 0.95f, 0.9f));
+                draw.addRectFilled(b.x(), b.y(), b.width() * ratio, b.height(), 2.0f, col);
+            }
+            draw.addRect(b.x(), b.y(), b.width(), b.height(), 2.0f, new MutableColor(0.25f, 0.35f, 0.45f, 0.5f), 1.0f);
+        });
+        winContent.addChild(progressBar);
+
+        // 2. Сетка слотов (8 колонок, 7 рядов)
+        VBox grid = new VBox();
+        grid.spacing(4.0f);
+        grid.layout(s -> s.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO).alignItems(Align.CENTER));
+
+        int cols = 8;
+        int rows = 7;
+        for (int r = 0; r < rows; r++) {
+            HBox rowBox = new HBox();
+            rowBox.spacing(4.0f);
+            rowBox.layout(s -> s.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO));
+
+            for (int c = 0; c < cols; c++) {
+                int slotIndex = r * cols + c;
+                Widget slotWidget = createStorageSlotWidget(town, storage, slotIndex, unlockedSlots, townName, canvas, status);
+                rowBox.addChild(slotWidget);
+            }
+            grid.addChild(rowBox);
+        }
+
+        ScrollView scroll = new ScrollView(grid);
+        scroll.scrollStep(20.0f);
+        scroll.scrollbarGap(2.0f);
+        scroll.layout(s -> s.size(LayoutConstraints.AUTO, LayoutConstraints.AUTO)
+                .flexGrow(1.0f).flexShrink(1.0f)
+                .overflowX(Overflow.HIDDEN)
+                .overflowY(Overflow.AUTO));
+        winContent.addChild(scroll);
+
+        // 3. Нижняя панель действий (Расширение склада)
+        HBox bottomBar = new HBox();
+        bottomBar.spacing(6.0f);
+        bottomBar.layout(s -> s.height(26.0f).alignItems(Align.CENTER));
+
+        Label hintLabel = new Label("💡 Открыто " + unlockedSlots + " из " + TOTAL_STORAGE_SLOTS + " слотов");
+        hintLabel.color(new MutableColor(0.70f, 0.75f, 0.80f, 0.90f));
+        hintLabel.layout(s -> s.flexGrow(1.0f));
+        bottomBar.addChild(hintLabel);
+
+        if (unlockedSlots < TOTAL_STORAGE_SLOTS) {
+            Button expandBtn = new Button("➕ +8 слотов (1 CP)");
+            expandBtn.layout(s -> s.height(24.0f));
+            expandBtn.enabled(calculateTotalUsedCP() + 1 <= TOTAL_PLAYER_MAX_CP);
+            expandBtn.onClick(e -> {
+                if (calculateTotalUsedCP() + 1 <= TOTAL_PLAYER_MAX_CP) {
+                    storage.extraPurchasedSlots += 8;
+                    updateContributionPointsDisplay();
+                    updateTownLeftPanel(town, canvas, status);
+                    openTownStorageWindow(town, canvas, status);
+                    if (status != null) {
+                        status.text("Склад города " + townName + " расширен на +8 слотов (1 ОВ) 📦");
+                    }
+                }
+            });
+            bottomBar.addChild(expandBtn);
+        }
+
+        winContent.addChild(bottomBar);
+
+        activeStorageWindow.content(winContent);
+        activeStorageWindow.open();
+    }
+
+    private static Widget createStorageSlotWidget(
+            WorldObject town,
+            TownStorageData storage,
+            int slotIndex,
+            int unlockedSlots,
+            String townName,
+            WorldCanvas canvas,
+            Label status) {
+
+        boolean isUnlocked = (slotIndex < unlockedSlots);
+        boolean hasItem = isUnlocked && (slotIndex < storage.items.size()) && storage.items.get(slotIndex) != null && !storage.items.get(slotIndex).isEmpty();
+
+        Box slotBox = new Box();
+        slotBox.layout(s -> s.size(38.0f, 38.0f).alignItems(Align.CENTER).justifyContent(Justify.CENTER));
+        slotBox.backgroundVisible(true);
+        slotBox.borderVisible(true);
+        slotBox.radius(4.0f);
+        slotBox.borderWidth(1.2f);
+
+        if (!isUnlocked) {
+            // === ЗАКРЫТЫЙ СЛОТ ===
+            slotBox.background().set(0.02f, 0.025f, 0.035f, 0.90f);
+            slotBox.borderColor().set(0.18f, 0.20f, 0.25f, 0.50f);
+
+            Label lockIcon = new Label("🔒");
+            lockIcon.color(new MutableColor(0.70f, 0.35f, 0.35f, 0.65f));
+            slotBox.addChild(lockIcon);
+
+            Tooltip lockTooltip = new Tooltip(slotBox, "🔒 Закрытый слот #" + (slotIndex + 1)
+                    + "\nУлучшите дома города («Склад» ур. 1–5)\nили вложите ОВ для расширения.");
+            lockTooltip.background().set(0.08f, 0.09f, 0.12f, 0.95f);
+            lockTooltip.borderColor().set(0.85f, 0.35f, 0.25f, 0.90f);
+            lockTooltip.radius(4.0f);
+            lockTooltip.offset(4.0f, 6.0f);
+            lockTooltip.maxWidth(240.0f);
+
+            STORAGE_TOOLTIPS.add(lockTooltip);
+            if (activeRootOverlay != null) {
+                activeRootOverlay.addOverlay(lockTooltip);
+            }
+
+            slotBox.renderer((draw, w) -> {
+                RectView b = w.layoutBounds();
+                if (slotBox.hovered()) {
+                    draw.addRectFilled(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(0.80f, 0.25f, 0.20f, 0.15f));
+                    draw.addRect(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(0.85f, 0.35f, 0.30f, 0.85f), 1.4f);
+                }
+            });
+
+            slotBox.on(PointerPressedEvent.TYPE, e -> {
+                if (status != null) {
+                    status.text("Слот #" + (slotIndex + 1) + " закрыт. Улучшите жилые дома в режим «Склад».");
+                }
+            });
+        } else if (hasItem) {
+            // === ОТКРЫТЫЙ СЛОТ С ПРЕДМЕТОМ ===
+            ItemStack stack = storage.items.get(slotIndex);
+
+            slotBox.background().set(0.04f, 0.05f, 0.08f, 0.92f);
+            slotBox.borderColor().set(0.24f, 0.32f, 0.44f, 0.85f);
+
+            MinecraftItemPreviewWidget preview = new MinecraftItemPreviewWidget("", stack);
+            preview.labelVisible(false);
+            preview.previewSize(20.0f);
+            preview.backgroundVisible(false);
+            preview.borderVisible(false);
+            preview.layout(s -> s.size(36.0f, 36.0f));
+
+            MinecraftItemTooltip itemTooltip = preview.vanillaTooltip();
+            STORAGE_TOOLTIPS.add(itemTooltip);
+            if (activeRootOverlay != null) {
+                activeRootOverlay.addOverlay(itemTooltip);
+            }
+
+            slotBox.addChild(preview);
+
+            slotBox.renderer((draw, w) -> {
+                RectView b = w.layoutBounds();
+                if (slotBox.hovered()) {
+                    draw.addRectFilled(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(1.0f, 0.85f, 0.30f, 0.15f));
+                    draw.addRect(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(1.0f, 0.85f, 0.30f, 0.95f), 1.5f);
+                }
+            });
+
+            slotBox.on(PointerPressedEvent.TYPE, e -> {
+                if (status != null) {
+                    status.text("Склад " + townName + ": [" + stack.getHoverName().getString()
+                            + " x" + stack.getCount() + "] в слоте #" + (slotIndex + 1));
+                }
+            });
+        } else {
+            // === ОТКРЫТЫЙ ПУСТОЙ СЛОТ ===
+            slotBox.background().set(0.035f, 0.045f, 0.065f, 0.85f);
+            slotBox.borderColor().set(0.18f, 0.22f, 0.28f, 0.70f);
+
+            Tooltip emptyTooltip = new Tooltip(slotBox, "Пустой слот #" + (slotIndex + 1));
+            emptyTooltip.background().set(0.08f, 0.09f, 0.12f, 0.95f);
+            emptyTooltip.borderColor().set(0.40f, 0.50f, 0.65f, 0.85f);
+            emptyTooltip.radius(4.0f);
+            emptyTooltip.offset(4.0f, 6.0f);
+
+            STORAGE_TOOLTIPS.add(emptyTooltip);
+            if (activeRootOverlay != null) {
+                activeRootOverlay.addOverlay(emptyTooltip);
+            }
+
+            slotBox.renderer((draw, w) -> {
+                RectView b = w.layoutBounds();
+                if (slotBox.hovered()) {
+                    draw.addRectFilled(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(1.0f, 1.0f, 1.0f, 0.08f));
+                    draw.addRect(b.x(), b.y(), b.width(), b.height(), 4.0f,
+                            new MutableColor(0.45f, 0.60f, 0.80f, 0.80f), 1.2f);
+                }
+            });
+
+            slotBox.on(PointerPressedEvent.TYPE, e -> {
+                if (status != null) {
+                    status.text("Слот #" + (slotIndex + 1) + " пуст.");
+                }
+            });
+        }
+
+        return slotBox;
     }
 }
