@@ -91,4 +91,9 @@ public class Field<Value> {
     public boolean isEqualTo(Value snapshot) {
         return codec.areEqual(value, snapshot);
     }
+
+    @Override
+    public String toString() {
+        return value.toString();
+    }
 }

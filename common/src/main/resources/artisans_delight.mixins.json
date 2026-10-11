@@ -1,11 +1,14 @@
 {
   "required": true,
-  "package": "dev.sixik.artisans_delight.mixin",
+  "package": "dev.sixik.artisans_delight.mod.mixin",
   "compatibilityLevel": "JAVA_21",
   "minVersion": "0.8",
   "client": [
   ],
   "mixins": [
+    "com.MixinLevel$customObjectManager",
+    "generation.MixinChunkGenerator$injectStructurePlace",
+    "generation.MixinChunkStatusTasks$injectStructureGeneration"
   ],
   "injectors": {
     "defaultRequire": 1

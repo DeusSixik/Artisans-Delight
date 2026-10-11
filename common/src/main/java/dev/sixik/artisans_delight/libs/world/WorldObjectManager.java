@@ -43,6 +43,8 @@ public final class WorldObjectManager implements AutoCloseable {
     private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private final AtomicLong tickCounter = new AtomicLong();
 
+    private boolean closed = false;
+
     /**
      * Creates, activates and registers a new object.
      */
@@ -212,5 +214,10 @@ public final class WorldObjectManager implements AutoCloseable {
             }
             fireRemoved(object);
         }
+        closed = true;
+    }
+
+    public boolean isClosed() {
+        return closed;
     }
 }

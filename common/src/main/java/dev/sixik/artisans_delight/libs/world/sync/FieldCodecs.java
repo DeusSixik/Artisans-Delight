@@ -1,7 +1,13 @@
 package dev.sixik.artisans_delight.libs.world.sync;
 
-import java.util.ArrayList;
+import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectMaps;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
+import it.unimi.dsi.fastutil.objects.ObjectLists;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -20,13 +26,14 @@ import net.minecraft.network.FriendlyByteBuf;
  * Built-in {@link FieldCodec} instances and combinators.
  *
  * <p>All codecs are stateless singletons (except parameterized {@link #listOf} /
- * {@link #enumCodec} results) and safe to share across threads. Every schema name
- * is stable across restarts; renaming one breaks network compatibility by design,
- * because {@code SyncedWorldObjectComponent} compares schemas on delta reads.
+ * {@link #mapOf} / {@link #enumCodec} results) and safe to share across threads.
+ * Every schema name is stable across restarts; renaming one breaks network
+ * compatibility by design, because {@code SyncedWorldObjectComponent} compares
+ * schemas on delta reads.
  *
- * <p>Copy semantics: immutable values return as-is; {@link #listOf} and
- * {@link #compoundOf} deep-copy through their element codecs so snapshots never
- * alias live state.
+ * <p>Copy semantics: immutable values return as-is; {@link #listOf},
+ * {@link #mapOf} and {@link #compoundOf} deep-copy through their element codecs
+ * so snapshots never alias live state.
  */
 public final class FieldCodecs {
 
@@ -154,11 +161,13 @@ public final class FieldCodecs {
     }
 
     /**
-     * List codec: defensive copy on snapshot, order-preserving, element-wise equality.
+     * List codec over fastutil {@link ObjectList}: defensive copy on snapshot,
+     * order-preserving, element-wise equality. All decoded/copied values are
+     * {@link ObjectArrayList} instances — no JDK boxing lists on the hot path.
      */
-    public static <Value> FieldCodec<List<Value>> listOf(FieldCodec<Value> element) {
+    public static <Value> FieldCodec<ObjectList<Value>> listOf(FieldCodec<Value> element) {
         Objects.requireNonNull(element, "element");
-        return FieldCodec.<List<Value>>builder()
+        return FieldCodec.<ObjectList<Value>>builder()
                 .schema("list<" + element.schemaName() + ">")
                 .nbt((nbt, key, value) -> {
                     ListTag list = new ListTag();
@@ -172,7 +181,7 @@ public final class FieldCodecs {
                     if (!(nbt.get(key) instanceof ListTag list)) {
                         return defaultValue;
                     }
-                    List<Value> result = new ArrayList<>(list.size());
+                    ObjectList<Value> result = new ObjectArrayList<>(list.size());
                     for (Tag child : list) {
                         result.add(element.fromNbtElement(child, null));
                     }
@@ -190,14 +199,14 @@ public final class FieldCodecs {
                     if (!(tag instanceof ListTag list)) {
                         return defaultValue;
                     }
-                    List<Value> result = new ArrayList<>(list.size());
+                    ObjectList<Value> result = new ObjectArrayList<>(list.size());
                     for (Tag child : list) {
                         result.add(element.fromNbtElement(child, null));
                     }
                     return result;
                 })
                 .network((buf, value) -> {
-                    List<Value> safe = value == null ? List.of() : value;
+                    ObjectList<Value> safe = value == null ? ObjectLists.emptyList() : value;
                     buf.writeVarInt(safe.size());
                     for (Value item : safe) {
                         element.toNetwork(buf, item);
@@ -207,7 +216,7 @@ public final class FieldCodecs {
                     if (size < 0 || size > 65536) {
                         throw new SyncException("List size out of bounds: " + size);
                     }
-                    List<Value> result = new ArrayList<>(size);
+                    ObjectList<Value> result = new ObjectArrayList<>(size);
                     for (int i = 0; i < size; i++) {
                         result.add(element.fromNetwork(buf));
                     }
@@ -217,7 +226,7 @@ public final class FieldCodecs {
                     if (value == null) {
                         return null;
                     }
-                    List<Value> copy = new ArrayList<>(value.size());
+                    ObjectList<Value> copy = new ObjectArrayList<>(value.size());
                     for (Value item : value) {
                         copy.add(element.copy(item));
                     }
@@ -238,6 +247,119 @@ public final class FieldCodecs {
                     return true;
                 })
                 .build();
+    }
+
+    /**
+     * Map codec over fastutil {@link Object2ObjectMap} with a string-key codec
+     * and arbitrary value codec. All decoded/copied values are
+     * {@link Object2ObjectOpenHashMap} instances.
+     *
+     * <p>NBT: compound, keys must survive {@code keyCodec.toNbtElement/fromNbtElement}
+     * round-trip (string keys natively, other key types via their element form).
+     * Network: var-int size, then key+value pairs. Copy is deep on both sides,
+     * equality is order-independent and element-wise. Size caps mirror
+     * {@link #listOf}: 65536 entries max on decode.
+     */
+    public static <Key, Value> FieldCodec<Object2ObjectMap<Key, Value>> mapOf(
+            FieldCodec<Key> keyCodec, FieldCodec<Value> valueCodec) {
+        Objects.requireNonNull(keyCodec, "keyCodec");
+        Objects.requireNonNull(valueCodec, "valueCodec");
+        return FieldCodec.<Object2ObjectMap<Key, Value>>builder()
+                .schema("map<" + keyCodec.schemaName() + "," + valueCodec.schemaName() + ">")
+                .nbt((nbt, key, value) -> {
+                    CompoundTag child = new CompoundTag();
+                    if (value != null) {
+                        for (Object2ObjectMap.Entry<Key, Value> entry : value.object2ObjectEntrySet()) {
+                            Tag encodedKey = keyCodec.toNbtElement(entry.getKey());
+                            if (!(encodedKey instanceof StringTag text)) {
+                                throw new SyncException("Map NBT keys must encode to StringTag, got "
+                                        + encodedKey.getClass().getSimpleName());
+                            }
+                            child.put(text.getAsString(), valueCodec.toNbtElement(entry.getValue()));
+                        }
+                    }
+                    nbt.put(key, child);
+                }, (nbt, key, defaultValue) -> {
+                    if (!(nbt.get(key) instanceof CompoundTag child)) {
+                        return defaultValue;
+                    }
+                    return readMapEntries(child, keyCodec, valueCodec);
+                })
+                .nbtElement(value -> {
+                    CompoundTag child = new CompoundTag();
+                    if (value != null) {
+                        for (Object2ObjectMap.Entry<Key, Value> entry : value.object2ObjectEntrySet()) {
+                            Tag encodedKey = keyCodec.toNbtElement(entry.getKey());
+                            if (!(encodedKey instanceof StringTag text)) {
+                                throw new SyncException("Map NBT keys must encode to StringTag, got "
+                                        + encodedKey.getClass().getSimpleName());
+                            }
+                            child.put(text.getAsString(), valueCodec.toNbtElement(entry.getValue()));
+                        }
+                    }
+                    return child;
+                }, (tag, defaultValue) -> tag instanceof CompoundTag child
+                        ? readMapEntries(child, keyCodec, valueCodec)
+                        : defaultValue)
+                .network((buf, value) -> {
+                    Object2ObjectMap<Key, Value> safe = value == null ? Object2ObjectMaps.emptyMap() : value;
+                    buf.writeVarInt(safe.size());
+                    for (Object2ObjectMap.Entry<Key, Value> entry : safe.object2ObjectEntrySet()) {
+                        keyCodec.toNetwork(buf, entry.getKey());
+                        valueCodec.toNetwork(buf, entry.getValue());
+                    }
+                }, buf -> {
+                    int size = buf.readVarInt();
+                    if (size < 0 || size > 65536) {
+                        throw new SyncException("Map size out of bounds: " + size);
+                    }
+                    Object2ObjectMap<Key, Value> result = new Object2ObjectOpenHashMap<>(size);
+                    for (int i = 0; i < size; i++) {
+                        result.put(keyCodec.fromNetwork(buf), valueCodec.fromNetwork(buf));
+                    }
+                    return result;
+                })
+                .copy(value -> {
+                    if (value == null) {
+                        return null;
+                    }
+                    Object2ObjectMap<Key, Value> copy = new Object2ObjectOpenHashMap<>(value.size());
+                    for (Object2ObjectMap.Entry<Key, Value> entry : value.object2ObjectEntrySet()) {
+                        copy.put(keyCodec.copy(entry.getKey()), valueCodec.copy(entry.getValue()));
+                    }
+                    return copy;
+                })
+                .equality((first, second) -> {
+                    if (first == second) {
+                        return true;
+                    }
+                    if (first == null || second == null || first.size() != second.size()) {
+                        return false;
+                    }
+                    for (Object2ObjectMap.Entry<Key, Value> entry : first.object2ObjectEntrySet()) {
+                        if (!second.containsKey(entry.getKey())) {
+                            return false;
+                        }
+                        if (!valueCodec.areEqual(entry.getValue(), second.get(entry.getKey()))) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })
+                .build();
+    }
+
+    private static <Key, Value> Object2ObjectMap<Key, Value> readMapEntries(
+            CompoundTag child, FieldCodec<Key> keyCodec, FieldCodec<Value> valueCodec) {
+        Object2ObjectMap<Key, Value> result = new Object2ObjectOpenHashMap<>();
+        for (String encodedKey : child.getAllKeys()) {
+            Key key = keyCodec.fromNbtElement(StringTag.valueOf(encodedKey), null);
+            if (key == null) {
+                continue;
+            }
+            result.put(key, valueCodec.fromNbtElement(child.get(encodedKey), null));
+        }
+        return result;
     }
 
     /**

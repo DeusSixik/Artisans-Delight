@@ -38,6 +38,8 @@ dependencies {
 
     common(project(path: ':common', configuration: 'namedElements')) { transitive false }
     shadowBundle project(path: ':common', configuration: 'transformProductionNeoForge')
+
+    modRuntimeOnly ("com.github.DeusSixik.UniGUI:unigui-neoforge-${minecraft_version}:${unigui_version}")
 }
 
 processResources {

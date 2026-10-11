@@ -11,11 +11,11 @@ import dev.sixik.artisans_delight.libs.world.sync.SyncedWorldObjectComponent;
 import dev.sixik.artisans_delight.libs.world.sync.TrackedField;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
+import it.unimi.dsi.fastutil.objects.ObjectLists;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
-
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * Минимальный пример использования WorldComponent.
@@ -59,15 +59,15 @@ public final class WorldComponentDemo {
     public static final class SearchCacheComponent extends SingleThreadedWorldObjectComponent {
 
         private final Field<Integer> queries = field("queries", FieldCodecs.intValue(), 0);
-        private final Field<List<String>> hits =
-                field("hits", FieldCodecs.listOf(FieldCodecs.string()), List.of());
+        private final Field<ObjectList<String>> hits =
+                field("hits", FieldCodecs.listOf(FieldCodecs.string()), ObjectLists.emptyList());
 
         public void recordQuery(String query) {
             checkThread();
             queries.update(value -> value + 1);
             if (query != null && query.length() > 2) {
                 hits.update(current -> {
-                    List<String> next = new ArrayList<>(current);
+                    ObjectList<String> next = new ObjectArrayList<>(current);
                     next.add(query);
                     return next;
                 });
@@ -79,7 +79,7 @@ public final class WorldComponentDemo {
             return queries.get();
         }
 
-        public List<String> hits() {
+        public ObjectList<String> hits() {
             checkThread();
             return hits.get();
         }
