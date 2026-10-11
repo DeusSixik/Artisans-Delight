@@ -16,6 +16,8 @@ import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.RandomState;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -194,5 +196,29 @@ public final class RouteGenerator {
         ObjectList<RoadPoint2D> reversed = new ObjectArrayList<>(finalPath);
         Collections.reverse(reversed);
         routesB.addOrUpdateRoute(new KnotRouteEntry(knotA.id(), reversed, sea, dist));
+
+        // Автоматически объединяем параллельные/сходящиеся дороги у обоих узлов (развилки)
+        if (!isSeaRoute) {
+            Map<UUID, WorldObject> localMap = new HashMap<>();
+            localMap.put(knotA.id(), knotA);
+            localMap.put(knotB.id(), knotB);
+            RouteBundler.bundleKnotRoutes(knotA, localMap);
+            RouteBundler.bundleKnotRoutes(knotB, localMap);
+        }
+    }
+
+    /**
+     * Разорвать соединение и удалить сохраненный маршрут между двумя узлами.
+     */
+    public static void disconnectKnots(WorldObject knotA, WorldObject knotB) {
+        if (knotA == null || knotB == null) return;
+        UUID idA = knotA.id();
+        UUID idB = knotB.id();
+
+        knotA.getSingle(KnotConnectionComponent.class).ifPresent(c -> c.removeNeighbor(idB));
+        knotB.getSingle(KnotConnectionComponent.class).ifPresent(c -> c.removeNeighbor(idA));
+
+        knotA.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.removeRoute(idB));
+        knotB.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.removeRoute(idA));
     }
 }

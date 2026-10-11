@@ -7,6 +7,7 @@ import dev.sixik.artisans_delight.mod.api.ArtisansDelightConstants;
 import dev.sixik.artisans_delight.mod.api.KnotApi;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationData;
 import dev.sixik.artisans_delight.mod.core.generation.GenerationHook;
+import dev.sixik.artisans_delight.mod.core.generation.path.KnotNetworkGraph;
 import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
 import dev.sixik.artisans_delight.mod.core.generation.terrain.TerrainSampler;
 import dev.sixik.artisans_delight.mod.core.knot.KnotType;
@@ -79,18 +80,7 @@ public class MixinChunkGenerator$injectStructurePlace {
 
         manager.add(townKnot);
 
-        // Автоматически строим дороги к ближайшим городам (до 4000 блоков)
-        for (WorldObject existing : manager.all()) {
-            if (existing == townKnot) continue;
-            Optional<KnotMetaComponent> existingMeta = existing.getSingle(KnotMetaComponent.class);
-            if (existingMeta.isPresent() && existingMeta.get().type.get() == KnotType.TOWN) {
-                BlockPos otherPos = existingMeta.get().pos.get();
-                double dist = Math.hypot(sectionPos.origin().getX() - otherPos.getX(),
-                                         sectionPos.origin().getZ() - otherPos.getZ());
-                if (dist <= 4000.0) {
-                    RouteGenerator.connectKnotsAsync(townKnot, existing, chunkGenerator, data.getGenLevel(), randomState);
-                }
-            }
-        }
+        // Автоматически подключаем поселение к сети узлов мира без создания лишних прямых срезок
+        KnotNetworkGraph.connectNewKnot(townKnot, manager, chunkGenerator, data.getGenLevel(), randomState);
     }
 }

@@ -59,6 +59,16 @@ public record RoadPoint2D(int x, int z, boolean isBridge) {
         return Math.sqrt(distSqr(other));
     }
 
+    public double distance(int ox, int oz) {
+        return Math.sqrt(distSqr(ox, oz));
+    }
+
+    public double distance(double ox, double oz) {
+        double dx = (double) this.x - ox;
+        double dz = (double) this.z - oz;
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
     public static final FieldCodec<RoadPoint2D> CODEC = FieldCodecs.compoundOf(
             "artisansdelight:road_point_2d",
             (nbt, pt) -> {

@@ -1,5 +1,6 @@
 package dev.sixik.artisans_delight.libs.world.minecraft;
 
+import dev.sixik.artisans_delight.libs.world.WorldObject;
 import dev.sixik.artisans_delight.libs.world.WorldObjectManager;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import net.minecraft.resources.ResourceKey;
@@ -8,6 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 
 public final class WorldObjectManagerApi {
 
@@ -50,5 +53,20 @@ public final class WorldObjectManagerApi {
         }
 
         return isClient ? manager.client : manager.server;
+    }
+
+    public static Optional<WorldObject> findObject(UUID id) {
+        if (id == null) return Optional.empty();
+        for (WStorage storage : MANAGERS.values()) {
+            if (storage.server != null) {
+                Optional<WorldObject> obj = storage.server.get(id);
+                if (obj.isPresent()) return obj;
+            }
+            if (storage.client != null) {
+                Optional<WorldObject> obj = storage.client.get(id);
+                if (obj.isPresent()) return obj;
+            }
+        }
+        return Optional.empty();
     }
 }

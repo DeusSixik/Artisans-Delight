@@ -79,6 +79,7 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.MapColor;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.RandomState;
+import dev.sixik.artisans_delight.mod.core.generation.path.KnotNetworkGraph;
 import dev.sixik.artisans_delight.mod.core.generation.path.RouteGenerator;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownPortComponent;
@@ -318,35 +319,14 @@ public class TestMap {
             }
         }
 
-        // В одиночной игре гарантируем расчет маршрутов между существующими городами
+        // В одиночной игре гарантируем расчет маршрутов между существующими узлами по топологии графа
         if (minecraft.getSingleplayerServer() != null && minecraft.level != null && knots != null) {
             try {
                 ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
                 if (sLevel != null) {
                     ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
                     RandomState state = sLevel.getChunkSource().randomState();
-                    List<WorldObject> towns = new ArrayList<>();
-                    for (WorldObject obj : knots) {
-                        obj.getSingle(KnotMetaComponent.class).ifPresent(m -> {
-                            if (m.type.get() == KnotType.TOWN) towns.add(obj);
-                        });
-                    }
-                    for (int i = 0; i < towns.size(); i++) {
-                        WorldObject tA = towns.get(i);
-                        BlockPos pA = tA.getSingle(KnotMetaComponent.class).get().pos.get();
-                        for (int j = i + 1; j < towns.size(); j++) {
-                            WorldObject tB = towns.get(j);
-                            BlockPos pB = tB.getSingle(KnotMetaComponent.class).get().pos.get();
-                            double dist = Math.hypot(pA.getX() - pB.getX(), pA.getZ() - pB.getZ());
-                            if (dist <= 4000.0) {
-                                boolean hasRoute = tA.getSingle(KnotRoutesComponent.class)
-                                        .flatMap(r -> r.getRouteTo(tB.id())).isPresent();
-                                if (!hasRoute) {
-                                    RouteGenerator.connectKnotsAsync(tA, tB, gen, sLevel, state);
-                                }
-                            }
-                        }
-                    }
+                    KnotNetworkGraph.rebuildNetwork(knots, gen, sLevel, state);
                 }
             } catch (Throwable ignored) {
             }
@@ -398,16 +378,11 @@ public class TestMap {
                                 RandomState state = sLevel.getChunkSource().randomState();
                                 for (WorldObject obj : currentKnotsCache) {
                                     obj.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.routes.get().clear());
+                                    obj.getSingle(KnotConnectionComponent.class).ifPresent(c -> c.neighbors.get().clear());
                                 }
-                                for (int i = 0; i < currentKnotsCache.size(); i++) {
-                                    WorldObject tA = currentKnotsCache.get(i);
-                                    for (int j = i + 1; j < currentKnotsCache.size(); j++) {
-                                        WorldObject tB = currentKnotsCache.get(j);
-                                        RouteGenerator.connectKnotsAsync(tA, tB, gen, sLevel, state);
-                                    }
-                                }
+                                KnotNetworkGraph.rebuildNetwork(currentKnotsCache, gen, sLevel, state);
                                 if (activeStatus != null) {
-                                    activeStatus.text("Маршруты сброшены и пересчитываются заново...");
+                                    activeStatus.text("Сеть узлов пересчитана и строится заново по графу...");
                                 }
                             }
                         } catch (Throwable ignored) {
@@ -1788,8 +1763,6 @@ public class TestMap {
         }
     }
 
-    private record NeighborCandidate(WorldObject obj, BlockPos pos, double dist) {
-    }
 
     private static PseudoEdge createPseudoEdge(WorldObject objA, WorldObject objB, BlockPos posA, BlockPos posB, double dist) {
         Optional<KnotRoutesComponent> rOptA = objA.getSingle(KnotRoutesComponent.class);
@@ -1821,57 +1794,18 @@ public class TestMap {
     }
 
     private static List<PseudoEdge> buildPseudoEdges(List<WorldObject> knots) {
-        Map<String, PseudoEdge> edges = new HashMap<>();
-        if (knots.size() < 2) return List.of();
+        if (knots == null || knots.size() < 2) return List.of();
 
-        for (int i = 0; i < knots.size(); i++) {
-            WorldObject objA = knots.get(i);
-            KnotMetaComponent metaA = objA.getSingle(KnotMetaComponent.class).get();
-            BlockPos posA = metaA.pos.get();
+        List<KnotNetworkGraph.GraphEdge> topology = KnotNetworkGraph.calculateTopology(knots);
+        List<PseudoEdge> edges = new ArrayList<>();
 
-            List<NeighborCandidate> candidates = new ArrayList<>();
-            for (int j = 0; j < knots.size(); j++) {
-                if (i == j) continue;
-                WorldObject objB = knots.get(j);
-                KnotMetaComponent metaB = objB.getSingle(KnotMetaComponent.class).get();
-                BlockPos posB = metaB.pos.get();
-                double dist = Math.hypot(posA.getX() - posB.getX(), posA.getZ() - posB.getZ());
-                candidates.add(new NeighborCandidate(objB, posB, dist));
-            }
-
-            candidates.sort(Comparator.comparingDouble(NeighborCandidate::dist));
-
-            // Связываем с самым ближайшим соседом (до 6000 блоков)
-            if (!candidates.isEmpty()) {
-                NeighborCandidate c1 = candidates.get(0);
-                if (c1.dist <= 6000.0) {
-                    PseudoEdge e = createPseudoEdge(objA, c1.obj, posA, c1.pos, c1.dist);
-                    edges.putIfAbsent(e.key(), e);
-                }
-            }
-
-            // Связываем со вторым ближайшим, если он не слишком далеко по сравнению с первым
-            if (candidates.size() > 1) {
-                NeighborCandidate c1 = candidates.get(0);
-                NeighborCandidate c2 = candidates.get(1);
-                if (c2.dist <= 6000.0 && c2.dist <= c1.dist * 1.85) {
-                    PseudoEdge e = createPseudoEdge(objA, c2.obj, posA, c2.pos, c2.dist);
-                    edges.putIfAbsent(e.key(), e);
-                }
-            }
-
-            // Связываем с третьим, если узлы сгруппированы в плотный кластер
-            if (candidates.size() > 2) {
-                NeighborCandidate c1 = candidates.get(0);
-                NeighborCandidate c3 = candidates.get(2);
-                if (c3.dist <= 4000.0 && c3.dist <= c1.dist * 1.35) {
-                    PseudoEdge e = createPseudoEdge(objA, c3.obj, posA, c3.pos, c3.dist);
-                    edges.putIfAbsent(e.key(), e);
-                }
-            }
+        for (KnotNetworkGraph.GraphEdge edge : topology) {
+            BlockPos pA = edge.a().getSingle(KnotMetaComponent.class).get().pos.get();
+            BlockPos pB = edge.b().getSingle(KnotMetaComponent.class).get().pos.get();
+            edges.add(createPseudoEdge(edge.a(), edge.b(), pA, pB, edge.distance()));
         }
 
-        return new ArrayList<>(edges.values());
+        return edges;
     }
 
     /**
