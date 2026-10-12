@@ -1,6 +1,7 @@
 package dev.sixik.artisans_delight.mod.core.generation.path;
 
 import dev.sixik.artisans_delight.libs.world.WorldObject;
+import dev.sixik.artisans_delight.libs.world.WorldObjectManager;
 import dev.sixik.artisans_delight.mod.core.generation.terrain.TerrainSampler;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
@@ -34,7 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class RouteGenerator {
 
-    private static final ExecutorService ROUTE_EXECUTOR = Executors.newFixedThreadPool(
+    static final ExecutorService ROUTE_EXECUTOR = Executors.newFixedThreadPool(
             Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1)),
             new ThreadFactory() {
                 private final AtomicInteger counter = new AtomicInteger(1);
@@ -59,6 +60,20 @@ public final class RouteGenerator {
     public static CompletableFuture<Void> connectKnotsAsync(
             WorldObject knotA, WorldObject knotB,
             ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState) {
+        return connectKnotsAsync(knotA, knotB, generator, heightAccessor, randomState, null);
+    }
+
+    /**
+     * Асинхронно построить соединение и маршрут между двумя узлами без блокировки вызывающего потока.
+     *
+     * @param manager менеджер мира для создания связующих узлов-развилок
+     *                (см. {@link JunctionEngine}); может быть {@code null} —
+     *                тогда развилки не строятся, только сам маршрут.
+     */
+    public static CompletableFuture<Void> connectKnotsAsync(
+            WorldObject knotA, WorldObject knotB,
+            ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
+            WorldObjectManager manager) {
 
         if (knotA == null || knotB == null) {
             return CompletableFuture.completedFuture(null);
@@ -83,6 +98,12 @@ public final class RouteGenerator {
         return CompletableFuture.runAsync(() -> {
             try {
                 connectKnots(knotA, knotB, generator, heightAccessor, randomState);
+                if (manager != null) {
+                    try {
+                        JunctionEngine.onNewRoute(knotA, knotB, manager);
+                    } catch (Throwable ignored) {
+                    }
+                }
             } catch (Throwable ignored) {
             } finally {
                 PENDING_ROUTES.remove(edgeKey);
@@ -101,8 +122,8 @@ public final class RouteGenerator {
         KnotMetaComponent metaB = knotB.getSingle(KnotMetaComponent.class).orElse(null);
         if (metaA == null || metaB == null) return;
 
-        BlockPos posA = metaA.pos.get();
-        BlockPos posB = metaB.pos.get();
+        BlockPos posA = metaA.position.get();
+        BlockPos posB = metaB.position.get();
 
         boolean isSeaRoute = false;
         ObjectList<RoadPoint2D> path = null;

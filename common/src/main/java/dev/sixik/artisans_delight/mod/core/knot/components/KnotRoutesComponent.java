@@ -86,6 +86,16 @@ public class KnotRoutesComponent extends SyncedWorldObjectComponent {
         });
     }
 
+    /**
+     * Полный сброс маршрутов (обычных и базовых) с корректным поднятием ревизии поля.
+     * Прямой вызов {@code routes.get().clear()} запрещен: он мутирует живой список
+     * мимо {@link TrackedField#update}, и сетевые дельты не видят изменения.
+     */
+    public void clearAllRoutes() {
+        routes.update(list -> ObjectLists.emptyList());
+        baselineRoutes.update(list -> ObjectLists.emptyList());
+    }
+
     public Optional<KnotRouteEntry> getRouteTo(UUID targetKnotId) {
         for (KnotRouteEntry entry : routes.get()) {
             if (entry.targetKnotId().equals(targetKnotId)) {

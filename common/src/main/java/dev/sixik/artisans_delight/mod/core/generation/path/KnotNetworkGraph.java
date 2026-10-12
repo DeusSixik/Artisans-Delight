@@ -2,15 +2,19 @@ package dev.sixik.artisans_delight.mod.core.generation.path;
 
 import dev.sixik.artisans_delight.libs.world.WorldObject;
 import dev.sixik.artisans_delight.libs.world.WorldObjectManager;
+import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.LevelHeightAccessor;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.RandomState;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Топологический решатель сети узлов мира (Node Graph Network).
@@ -112,6 +116,10 @@ public final class KnotNetworkGraph {
     /**
      * Расчет эталонной топологии графа для заданной коллекции узлов.
      * Гарантирует отсутствие прямых связей в обход промежуточных узлов и исключает пересечения дорог.
+     *
+     * <p>WAYPOINT-развилки в топологии не участвуют: их связями владеет {@link JunctionEngine}.
+     * Иначе планарный фильтр пытался бы строить A* между городом и чужой развилкой
+     * и воссоздавал бы прямые ребра поверх разрезов.
      */
     public static List<GraphEdge> calculateTopology(Collection<WorldObject> knots) {
         if (knots == null || knots.size() < 2) return List.of();
@@ -119,9 +127,10 @@ public final class KnotNetworkGraph {
         List<WorldObject> knotList = new ArrayList<>();
         Map<UUID, BlockPos> posMap = new HashMap<>();
         for (WorldObject obj : knots) {
+            if (isWaypoint(obj)) continue;
             obj.getSingle(KnotMetaComponent.class).ifPresent(m -> {
                 knotList.add(obj);
-                posMap.put(obj.id(), m.pos.get());
+                posMap.put(obj.id(), m.position.get());
             });
         }
 
@@ -205,10 +214,11 @@ public final class KnotNetworkGraph {
         KnotMetaComponent newMeta = newKnot.getSingle(KnotMetaComponent.class).orElse(null);
         if (newMeta == null) return;
 
-        BlockPos newPos = newMeta.pos.get();
+        BlockPos newPos = newMeta.position.get();
         Collection<WorldObject> allKnots = manager.all();
 
         // 1. Проверяем все существующие соединения. Если newKnot встал прямо между A и B, разрываем прямую связь A-B!
+        // Ребра с WAYPOINT-развилками не трогаем: ими владеет JunctionEngine.
         for (WorldObject oA : allKnots) {
             if (oA == newKnot) continue;
             KnotConnectionComponent connA = oA.getSingle(KnotConnectionComponent.class).orElse(null);
@@ -221,20 +231,44 @@ public final class KnotNetworkGraph {
                 if (oB == null || oB == newKnot) continue;
                 KnotMetaComponent metaB = oB.getSingle(KnotMetaComponent.class).orElse(null);
                 if (metaB == null) continue;
+                if (isWaypoint(oA) || isWaypoint(oB)) continue;
 
                 // Проверяем, встал ли newKnot между oA и oB
-                if (isIntermediateNode(metaA.pos.get(), metaB.pos.get(), newPos)) {
+                if (isIntermediateNode(metaA.position.get(), metaB.position.get(), newPos)) {
                     RouteGenerator.disconnectKnots(oA, oB);
                 }
             }
         }
 
+        // 1.5 Целевая протяжка существующих дорог через новую деревню.
+        // Дороги, построенные раньше, чем деревня сгенерировалась, прошли мимо
+        // неё и оставались «мимо» навсегда — теперь разрезаются и заходят в город.
+        if (newMeta.type.get() == KnotType.TOWN) {
+            try {
+                JunctionEngine.snapEdgesViaTown(newKnot, manager);
+            } catch (Throwable ignored) {
+            }
+        }
+
         // 2. Находим, с какими узлами должен соединиться newKnot согласно топологии графа
         List<GraphEdge> validTopology = calculateTopology(allKnots);
+        List<CompletableFuture<Void>> routeFutures = new ArrayList<>();
         for (GraphEdge edge : validTopology) {
             if (edge.a().id().equals(newKnot.id()) || edge.b().id().equals(newKnot.id())) {
-                RouteGenerator.connectKnotsAsync(edge.a(), edge.b(), generator, heightAccessor, randomState);
+                CompletableFuture<Void> future = RouteGenerator.connectKnotsAsync(edge.a(), edge.b(), generator, heightAccessor, randomState, manager);
+                routeFutures.add(future);
             }
+        }
+        
+        // Запускаем resolveNetwork после завершения всех маршрутов (через 3 секунды)
+        if (!routeFutures.isEmpty() && manager != null) {
+            CompletableFuture.allOf(routeFutures.toArray(new CompletableFuture[0]))
+                .thenRunAsync(() -> {
+                    try {
+                        Thread.sleep(3000); // Даём время на завершение всех параллельных маршрутов
+                        JunctionEngine.resolveNetwork(allKnots, manager);
+                    } catch (Throwable ignored) {}
+                }, RouteGenerator.ROUTE_EXECUTOR);
         }
     }
 
@@ -244,8 +278,51 @@ public final class KnotNetworkGraph {
     public static void rebuildNetwork(
             Collection<WorldObject> knots,
             ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState) {
+        rebuildNetwork(knots, generator, heightAccessor, randomState, null, 0L);
+    }
+
+    /**
+     * Полный пересчет сети узлов мира: удаляет любые устаревшие прямые срезки и строит правильный граф.
+     *
+     * @param manager менеджер мира для создания связующих узлов-развилок
+     *                (см. {@link JunctionEngine}); может быть {@code null}.
+     */
+    public static void rebuildNetwork(
+            Collection<WorldObject> knots,
+            ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
+            WorldObjectManager manager) {
+        rebuildNetwork(knots, generator, heightAccessor, randomState, manager, 0L);
+    }
+
+    /**
+     * Полный пересчет сети узлов мира с указанием сида мира.
+     *
+     * @param worldSeed сид мира (для детерминированности)
+     */
+    public static void rebuildNetwork(
+            Collection<WorldObject> knots,
+            ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
+            WorldObjectManager manager,
+            long worldSeed) {
 
         if (knots == null || knots.size() < 2) return;
+        
+        // ===== НОВАЯ ДВУХСЛОЙНАЯ СИСТЕМА ГЕНЕРАЦИИ =====
+        // Включаем новую систему ТОЛЬКО с грубой сеткой (без детального A*)
+        if (manager != null && worldSeed != 0L) {
+            try {
+                System.out.println("[KnotNetworkGraph] Активирую новую систему генерации узлов...");
+                dev.sixik.artisans_delight.mod.core.generation.grid.NetworkMigrationAdapter.buildNetworkV2(
+                    knots, manager, worldSeed, generator, heightAccessor, randomState
+                );
+                return; // Новая система обработала всё
+            } catch (Throwable e) {
+                e.printStackTrace();
+                System.err.println("[KnotNetworkGraph] ОШИБКА в новой системе! Откатываемся на старую...");
+                // Фолбэк на старую систему при ошибке
+            }
+        }
+        // ================================================
 
         // 1. Вычисляем эталонную топологию графа
         List<GraphEdge> validTopology = calculateTopology(knots);
@@ -259,7 +336,9 @@ public final class KnotNetworkGraph {
             knotMap.put(obj.id(), obj);
         }
 
-        // 2. Удаляем все существующие связи, которые не входят в правильную топологию (лишние прямые срезки)
+        // 2. Удаляем все существующие связи, которые не входят в правильную топологию (лишние прямые срезки).
+        // Связи через WAYPOINT-развилки ("A-J", "J-B") сохраняем всегда: топология строится
+        // только по TOWN/PRODUCTION-узлам и не знает о связующих развилках.
         for (WorldObject objA : knots) {
             KnotConnectionComponent connA = objA.getSingle(KnotConnectionComponent.class).orElse(null);
             if (connA == null) continue;
@@ -267,6 +346,10 @@ public final class KnotNetworkGraph {
             for (UUID neighborId : new ArrayList<>(connA.neighbors.get())) {
                 WorldObject objB = knotMap.get(neighborId);
                 if (objB == null) continue;
+
+                if (isWaypoint(objA) || isWaypoint(objB)) {
+                    continue;
+                }
 
                 String edgeKey = objA.id().compareTo(neighborId) < 0
                         ? objA.id() + "_" + neighborId
@@ -278,18 +361,97 @@ public final class KnotNetworkGraph {
             }
         }
 
-        // 3. Строим недостающие правильные маршруты топологии
+        // 3. Строим недостающие правильные маршруты топологии.
+        // Ребро A-B пропускаем, если города уже связаны через WAYPOINT-развилки
+        // (A-J1-J2-B): иначе воссоздадим прямую дорогу-призрак поверх разреза.
         for (GraphEdge edge : validTopology) {
             boolean hasRoute = edge.a().getSingle(KnotRoutesComponent.class)
                     .flatMap(r -> r.getRouteTo(edge.b().id()))
                     .isPresent();
 
-            if (!hasRoute) {
-                RouteGenerator.connectKnotsAsync(edge.a(), edge.b(), generator, heightAccessor, randomState);
+            if (!hasRoute && !sharesJunctionPath(edge.a(), edge.b(), knotMap)) {
+                RouteGenerator.connectKnotsAsync(edge.a(), edge.b(), generator, heightAccessor, randomState, manager);
             }
         }
 
-        // 4. Для уже существующих маршрутов выполняем объединение сходящихся коридоров и развилок
+        // 4. Для уже готовых маршрутов создаем явные связующие узлы-развилки (WAYPOINT)
+        // в местах схождения дорог: протяжки через попутные деревни и развилки
+        // на общих коридорах вне городов. Новые A* не запускаются — только хирургия полилиний.
+        if (manager != null) {
+            try {
+                JunctionEngine.resolveNetwork(knots, manager);
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // 5. Для уже существующих маршрутов выполняем объединение сходящихся коридоров и развилок
         RouteBundler.bundleAllRoutes(knots);
+    }
+
+    private static boolean isWaypoint(WorldObject o) {
+        if (o == null) return false;
+        return o.getSingle(KnotMetaComponent.class)
+                .map(m -> m.type.get() == KnotType.WAYPOINT)
+                .orElse(false);
+    }
+
+    /**
+     * Проверка, связаны ли два узла через цепочку WAYPOINT-развилок
+     * (общий сосед-J либо ствол J1-J2: A-J1, J1-J2, J2-B).
+     *
+     * <p>Обход в ширину строго по WAYPOINT-звеньям глубиной до 4: после
+     * нескольких проходов {@link JunctionEngine#resolveNetwork} между городами
+     * образуются длинные стволы (A-J1-J2-J3-B), которые проверка «в лоб»
+     * не видела и запускала повторный A*, кладя прямую дорогу-призрак
+     * поверх разрезанного коридора.
+     */
+    private static boolean sharesJunctionPath(WorldObject a, WorldObject b, Map<UUID, WorldObject> knotMap) {
+        if (a == null || b == null) return false;
+        KnotConnectionComponent connB = b.getSingle(KnotConnectionComponent.class).orElse(null);
+        if (connB == null) return false;
+
+        Set<UUID> bWaypoints = new HashSet<>();
+        for (UUID n : connB.neighbors.get()) {
+            WorldObject o = knotMap.get(n);
+            if (o != null && isWaypoint(o)) bWaypoints.add(n);
+        }
+        if (bWaypoints.isEmpty()) return false;
+
+        KnotConnectionComponent connA = a.getSingle(KnotConnectionComponent.class).orElse(null);
+        if (connA == null) return false;
+
+        Set<UUID> visited = new HashSet<>();
+        Deque<UUID> queue = new ArrayDeque<>();
+        for (UUID n : connA.neighbors.get()) {
+            WorldObject o = knotMap.get(n);
+            if (o != null && isWaypoint(o)) {
+                if (bWaypoints.contains(n)) return true;
+                queue.add(n);
+                visited.add(n);
+            }
+        }
+        if (queue.isEmpty()) return false;
+
+        int depth = 1;
+        while (!queue.isEmpty() && depth <= 4) {
+            int levelSize = queue.size();
+            for (int s = 0; s < levelSize; s++) {
+                UUID j = queue.poll();
+                WorldObject oJ = knotMap.get(j);
+                if (oJ == null) continue;
+                KnotConnectionComponent connJ = oJ.getSingle(KnotConnectionComponent.class).orElse(null);
+                if (connJ == null) continue;
+                for (UUID next : connJ.neighbors.get()) {
+                    if (!visited.add(next)) continue;
+                    if (bWaypoints.contains(next)) return true;
+                    WorldObject oNext = knotMap.get(next);
+                    if (oNext != null && isWaypoint(oNext)) {
+                        queue.add(next);
+                    }
+                }
+            }
+            depth++;
+        }
+        return false;
     }
 }

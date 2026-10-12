@@ -21,7 +21,7 @@ public class KnotMetaComponent extends SyncedWorldObjectComponent {
     public final TrackedField<String> name = tracked("name", FieldCodecs.string(), EMPTY_NAME);
     public final TrackedField<ResourceLocation> icon = tracked("icon", ExternFieldCodecs.resourceLocation(), ICON_EMPTY);
     public final TrackedField<KnotType> type = tracked("type", FieldCodecs.enumCodec(KnotType.class), KnotType.NONE);
-    public final TrackedField<BlockPos> pos = tracked("pos", ExternFieldCodecs.blockPos(), BlockPos.ZERO);
+    public final TrackedField<BlockPos> position = tracked("pos", ExternFieldCodecs.blockPos(), BlockPos.ZERO);
     public final TrackedField<UUID> uuid = tracked("uuid", FieldCodecs.uuid(), EMPTY_UUID);
     public final TrackedField<Integer> tier = tracked("tier", FieldCodecs.intValue(), 1);
 
@@ -36,8 +36,14 @@ public class KnotMetaComponent extends SyncedWorldObjectComponent {
         this.name.set(name);
         this.icon.set(icon);
         this.type.set(type);
-        this.pos.set(pos);
+        this.position.set(pos);
         this.uuid.set(uuid);
         this.tier.set(tier);
+    }
+    
+    public KnotMetaComponent(KnotType type, BlockPos pos) {
+        this.type.set(type);
+        this.position.set(pos);
+        this.uuid.set(UUID.randomUUID());
     }
 }

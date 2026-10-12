@@ -164,6 +164,39 @@ public final class CoarsePathfinder {
         return findLandRoad(generator, heightAccessor, randomState, startX, startZ, goalX, goalZ, PathConstraint.NONE);
     }
 
+    /**
+     * БЫСТРЫЙ грубый поиск сухопутной дороги с фиксированным крупным шагом сетки.
+     *
+     * <p>Используется для построения ГРУБОГО слоя сети (определение топологии и
+     * размещения промежуточных узлов). Не требует высокой точности, поэтому
+     * применяется крупный шаг (48-64 блока), что ускоряет A* в 4-8 раз по сравнению
+     * с детальным поиском. Геометрия дороги уточняется позже в тонком слое.
+     *
+     * @param step Шаг сетки в блоках (рекомендуется 48-64)
+     */
+    public static ObjectList<RoadPoint2D> findCoarseLandRoad(
+            ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
+            int startX, int startZ, int goalX, int goalZ, int step) {
+
+        FastTerrainCache cache = new FastTerrainCache(generator, heightAccessor, randomState);
+
+        BlockPos landStart = TerrainSampler.findNearestLand(generator, heightAccessor, randomState, startX, startZ, 64);
+        BlockPos landGoal = TerrainSampler.findNearestLand(generator, heightAccessor, randomState, goalX, goalZ, 64);
+
+        ObjectList<RoadPoint2D> path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, step, PathConstraint.NONE);
+        if (!path.isEmpty()) {
+            return ensureEndpoints(path, startX, startZ, goalX, goalZ);
+        }
+
+        // Резервный, ещё более грубый проход (если не прошли препятствия)
+        path = findPath(cache, landStart.getX(), landStart.getZ(), landGoal.getX(), landGoal.getZ(), false, step + 16, PathConstraint.NONE);
+        if (!path.isEmpty()) {
+            return ensureEndpoints(path, startX, startZ, goalX, goalZ);
+        }
+
+        return ObjectLists.emptyList();
+    }
+
     public static ObjectList<RoadPoint2D> findLandRoad(
             ChunkGenerator generator, LevelHeightAccessor heightAccessor, RandomState randomState,
             int startX, int startZ, int goalX, int goalZ, PathConstraint constraint) {

@@ -43,6 +43,7 @@ public final class WorldObjectManager implements AutoCloseable {
     private final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private final AtomicLong tickCounter = new AtomicLong();
 
+    private volatile boolean networkInitialized = false;
     private boolean closed = false;
 
     /**
@@ -219,5 +220,29 @@ public final class WorldObjectManager implements AutoCloseable {
 
     public boolean isClosed() {
         return closed;
+    }
+
+    /**
+     * Проверяет, была ли инициализирована дорожная сеть узлов.
+     * Сеть строится единожды после первой загрузки узлов мира,
+     * чтобы избежать повторной генерации перекрёстков при открытии карты.
+     */
+    public boolean isNetworkInitialized() {
+        return networkInitialized;
+    }
+
+    /**
+     * Помечает сеть как инициализированную после первичной генерации дорог.
+     * Этот флаг предотвращает повторные вызовы rebuildNetwork при открытии UI.
+     */
+    public void markNetworkInitialized() {
+        this.networkInitialized = true;
+    }
+
+    /**
+     * Сбрасывает флаг инициализации сети (для дебага и тестирования).
+     */
+    public void resetNetworkInitialization() {
+        this.networkInitialized = false;
     }
 }

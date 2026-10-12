@@ -256,7 +256,7 @@ public final class RouteBundler {
         KnotMetaComponent meta = knot.getSingle(KnotMetaComponent.class).orElse(null);
         if (routesComp == null || meta == null) return;
 
-        BlockPos knotPos = meta.pos.get();
+        BlockPos knotPos = meta.position.get();
         List<KnotRouteEntry> originalRoutes = new ArrayList<>(routesComp.routes.get());
         if (originalRoutes.size() < 2) return;
 

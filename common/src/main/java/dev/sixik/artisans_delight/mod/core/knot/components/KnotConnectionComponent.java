@@ -38,4 +38,13 @@ public class KnotConnectionComponent extends SyncedWorldObjectComponent {
             return next;
         });
     }
+
+    /**
+     * Полный сброс списка соседей с корректным поднятием ревизии поля.
+     * Прямой вызов {@code neighbors.get().clear()} запрещен: он мутирует живой
+     * список мимо {@link TrackedField#update}, и сетевые дельты не видят изменения.
+     */
+    public void clearNeighbors() {
+        neighbors.update(list -> ObjectLists.emptyList());
+    }
 }

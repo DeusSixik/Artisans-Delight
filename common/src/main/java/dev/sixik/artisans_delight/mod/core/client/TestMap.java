@@ -123,6 +123,7 @@ public class TestMap {
     private static OverlayLayer activeRootOverlay;
     private static WindowWidget activeHouseWindow;
     private static WindowWidget activeStorageWindow;
+    private static Box activeNetworkStatusBox; // Индикатор генерации сети (для авто-скрытия)
     private static final Map<UUID, List<TownHouseData>> TOWN_HOUSES = new HashMap<>();
     private static final Map<String, Tooltip> HOUSE_TOOLTIPS = new HashMap<>();
     private static final Map<UUID, TownStorageData> TOWN_STORAGES = new HashMap<>();
@@ -320,7 +321,8 @@ public class TestMap {
             }
         }
 
-        // В одиночной игре гарантируем расчет маршрутов между существующими узлами по топологии графа
+        // В одиночной игре запускаем асинхронную инициализацию сети на сервере
+        // Сеть строится в фоновом потоке, не блокируя UI
         if (minecraft.getSingleplayerServer() != null && minecraft.level != null && knots != null) {
             try {
                 ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
@@ -331,8 +333,12 @@ public class TestMap {
                     if (manager != null) {
                         SeedStructureLookahead.predictKnotsInRange(manager, sLevel, gen, state, center, 3500);
                         knots = manager.all();
+                        
+                        // НОВОЕ: Запускаем асинхронную генерацию сети (не блокирует UI)
+                        if (!manager.isNetworkInitialized() && !knots.isEmpty()) {
+                            dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer.initializeNetworkAsync(sLevel);
+                        }
                     }
-                    KnotNetworkGraph.rebuildNetwork(knots, gen, sLevel, state);
                 }
             } catch (Throwable ignored) {
             }
@@ -363,6 +369,24 @@ public class TestMap {
             }
 
             @Override
+            public void tick() {
+                super.tick();
+                // Авто-скрытие индикатора генерации, когда сеть готова
+                if (activeNetworkStatusBox != null && activeNetworkStatusBox.visible()) {
+                    boolean ready;
+                    if (minecraft.getSingleplayerServer() != null && minecraft.level != null) {
+                        ServerLevel sl = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                        ready = sl != null && dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer.isNetworkReady(sl);
+                    } else {
+                        ready = true;
+                    }
+                    if (ready) {
+                        activeNetworkStatusBox.visible(false);
+                    }
+                }
+            }
+
+            @Override
             public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
                 // 1. Ctrl + O: переключение DebugFlags.PROFILER_OVERLAY
                 if (keyCode == GLFW.GLFW_KEY_O && Screen.hasControlDown()) {
@@ -374,12 +398,17 @@ public class TestMap {
                     return true;
                 }
 
-                // 2. Ctrl + R: принудительный пересчет всех маршрутов дорог (сброс кэша путей)
+                // 2. Ctrl + R: принудительный пересчет всех маршрутов дорог (ТОЛЬКО ДЛЯ ДЕБАГА!)
+                // ВНИМАНИЕ: Синхронный пересчёт, будет зависать UI на 30-60 секунд!
                 if (keyCode == GLFW.GLFW_KEY_R && Screen.hasControlDown()) {
                     if (currentKnotsCache != null && minecraft.getSingleplayerServer() != null && minecraft.level != null) {
                         try {
                             ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
                             if (sLevel != null) {
+                                if (activeStatus != null) {
+                                    activeStatus.text("[DEBUG] Пересчитываю сеть... (может зависнуть на 30-60 сек)");
+                                }
+                                
                                 ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
                                 RandomState state = sLevel.getChunkSource().randomState();
                                 BlockPos center = minecraft.player != null ? minecraft.player.blockPosition() : BlockPos.ZERO;
@@ -389,12 +418,19 @@ public class TestMap {
                                     currentKnotsCache = new ArrayList<>(mgr.all());
                                 }
                                 for (WorldObject obj : currentKnotsCache) {
-                                    obj.getSingle(KnotRoutesComponent.class).ifPresent(r -> r.routes.get().clear());
-                                    obj.getSingle(KnotConnectionComponent.class).ifPresent(c -> c.neighbors.get().clear());
+                                    obj.getSingle(KnotRoutesComponent.class).ifPresent(KnotRoutesComponent::clearAllRoutes);
+                                    obj.getSingle(KnotConnectionComponent.class).ifPresent(KnotConnectionComponent::clearNeighbors);
                                 }
-                                KnotNetworkGraph.rebuildNetwork(currentKnotsCache, gen, sLevel, state);
+                                long worldSeed = sLevel.getChunkSource().getGeneratorState().getLevelSeed();
+                                
+                                // Синхронный пересчёт (для дебага)
+                                KnotNetworkGraph.rebuildNetwork(currentKnotsCache, gen, sLevel, state, mgr, worldSeed);
+                                
+                                if (mgr != null) {
+                                    mgr.markNetworkInitialized();
+                                }
                                 if (activeStatus != null) {
-                                    activeStatus.text("Сеть узлов пересчитана и строится заново по графу...");
+                                    activeStatus.text("[DEBUG] ✓ Сеть пересчитана");
                                 }
                             }
                         } catch (Throwable ignored) {
@@ -457,9 +493,12 @@ public class TestMap {
             targetWorldX = (float) minecraft.player.getX();
             targetWorldY = (float) minecraft.player.getZ();
         } else if (!knotList.isEmpty()) {
-            BlockPos firstPos = knotList.getFirst().getSingle(KnotMetaComponent.class).get().pos.get();
-            targetWorldX = (float) firstPos.getX();
-            targetWorldY = (float) firstPos.getZ();
+            Optional<KnotMetaComponent> firstMeta = knotList.getFirst().getSingle(KnotMetaComponent.class);
+            if (firstMeta.isPresent()) {
+                BlockPos firstPos = firstMeta.get().position.get();
+                targetWorldX = (float) firstPos.getX();
+                targetWorldY = (float) firstPos.getZ();
+            }
         }
 
         float initialZoom = 0.35f;
@@ -650,9 +689,12 @@ public class TestMap {
             Map<UUID, BlockPos> posMap = new HashMap<>();
             Map<UUID, Boolean> investedMap = new HashMap<>();
             for (WorldObject obj : knotList) {
-                KnotMetaComponent m = obj.getSingle(KnotMetaComponent.class).get();
-                posMap.put(obj.id(), m.pos.get());
-                posMap.put(m.uuid.get(), m.pos.get());
+                Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
+                if (mOpt.isEmpty()) continue;
+                
+                KnotMetaComponent m = mOpt.get();
+                posMap.put(obj.id(), m.position.get());
+                posMap.put(m.uuid.get(), m.position.get());
 
                 boolean inv = obj.getSingle(KnotConnectionComponent.class)
                         .map(c -> c.isInvested.get()).orElse(false);
@@ -669,7 +711,7 @@ public class TestMap {
                 if (mOpt.isEmpty() || cOpt.isEmpty()) continue;
 
                 UUID fromId = obj.id();
-                BlockPos fromPos = mOpt.get().pos.get();
+                BlockPos fromPos = mOpt.get().position.get();
                 boolean fromInvested = cOpt.get().isInvested.get();
 
                 for (UUID toId : cOpt.get().neighbors.get()) {
@@ -816,8 +858,11 @@ public class TestMap {
 
             // === 6. ОРЕОЛЫ И МАРКЕРЫ УЗЛОВ ===
             for (WorldObject obj : knotList) {
-                KnotMetaComponent m = obj.getSingle(KnotMetaComponent.class).get();
-                BlockPos pos = m.pos.get();
+                Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
+                if (mOpt.isEmpty()) continue;
+                
+                KnotMetaComponent m = mOpt.get();
+                BlockPos pos = m.position.get();
                 float kx = world.worldToRootX((float) pos.getX());
                 float ky = world.worldToRootY((float) pos.getZ());
 
@@ -825,11 +870,23 @@ public class TestMap {
                         .map(c -> c.isInvested.get()).orElse(false);
 
                 KnotType kType = m.type.get();
-                MutableColor haloColor = inv
-                        ? new MutableColor(1.0f, 0.82f, 0.22f, 0.65f)
-                        : (kType == KnotType.TOWN
-                            ? new MutableColor(0.25f, 0.55f, 0.95f, 0.55f)
-                            : new MutableColor(0.35f, 0.80f, 0.45f, 0.55f));
+                
+                // Определяем, морской ли это узел (проверяем имя)
+                boolean isSeaNode = kType == KnotType.WAYPOINT && 
+                                   m.name.get().startsWith("Sea Node");
+                
+                MutableColor haloColor;
+                if (isSeaNode) {
+                    // Морские узлы — голубые
+                    haloColor = new MutableColor(0.30f, 0.70f, 0.90f, 0.65f);
+                } else if (inv) {
+                    haloColor = new MutableColor(1.0f, 0.82f, 0.22f, 0.65f);
+                } else if (kType == KnotType.TOWN) {
+                    haloColor = new MutableColor(0.25f, 0.55f, 0.95f, 0.55f);
+                } else {
+                    // Обычные сухопутные waypoints — зелёные
+                    haloColor = new MutableColor(0.35f, 0.80f, 0.45f, 0.55f);
+                }
 
                 if (kType == KnotType.TOWN) {
                     // Зона юрисдикции города (отображается вокруг города)
@@ -865,8 +922,20 @@ public class TestMap {
                 }
 
                 // Круг-основание под кончиком метки на карте
-                draw.addCircleFilled(kx, ky, 7.0f, haloColor, 16);
-                draw.addCircle(kx, ky, 10.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.50f), 16, 1.5f);
+                if (isSeaNode) {
+                    // Морской узел — рисуем с волнами
+                    draw.addCircleFilled(kx, ky, 5.0f, haloColor, 16);
+                    draw.addCircle(kx, ky, 8.0f, new MutableColor(0.30f, 0.70f, 0.90f, 0.70f), 16, 1.5f);
+                    draw.addCircle(kx, ky, 12.0f, new MutableColor(0.30f, 0.70f, 0.90f, 0.40f), 16, 1.0f);
+                } else if (kType == KnotType.WAYPOINT) {
+                    // Сухопутный waypoint — маленький зелёный кружок
+                    draw.addCircleFilled(kx, ky, 4.0f, haloColor, 12);
+                    draw.addCircle(kx, ky, 6.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.40f), 12, 1.0f);
+                } else {
+                    // Город — стандартный большой маркер
+                    draw.addCircleFilled(kx, ky, 7.0f, haloColor, 16);
+                    draw.addCircle(kx, ky, 10.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.50f), 16, 1.5f);
+                }
             }
 
             // === 7. МАРКЕР ИГРОКА ===
@@ -1308,8 +1377,11 @@ public class TestMap {
 
         // Создаем интерактивные якоря (иконка узла с тултипом) для каждого узла
         for (WorldObject knot : knotList) {
-            KnotMetaComponent meta = knot.getSingle(KnotMetaComponent.class).get();
-            BlockPos pos = meta.pos.get();
+            Optional<KnotMetaComponent> metaOpt = knot.getSingle(KnotMetaComponent.class);
+            if (metaOpt.isEmpty()) continue;
+            
+            KnotMetaComponent meta = metaOpt.get();
+            BlockPos pos = meta.position.get();
             float worldX = (float) pos.getX();
             float worldY = (float) pos.getZ();
 
@@ -1436,7 +1508,138 @@ public class TestMap {
             clampTownViewport(canvas, 0.0f, 0.0f);
         });
 
+        // === ИНДИКАТОР ГЕНЕРАЦИИ СЕТИ (правый нижний угол) ===
+        // Кастомный renderer читает GenerationProgress в реальном времени и рисует
+        // название этапа, прогресс-бар, счётчик шагов и прошедшее время.
+        final Box[] networkStatusBoxRef = new Box[1];
+        final float[] progressAnimRef = new float[1]; // сглаженный прогресс 0..1
+
+        Box networkStatusBox = new Box();
+        networkStatusBox.backgroundVisible(true);
+        networkStatusBox.borderVisible(true);
+        networkStatusBox.background().set(0.05f, 0.06f, 0.09f, 0.94f);
+        networkStatusBox.borderColor().set(0.85f, 0.70f, 0.25f, 0.85f);
+        networkStatusBox.radius(5.0f);
+        networkStatusBox.borderWidth(1.2f);
+        networkStatusBox.layout(style -> style
+                .position(PositionType.ABSOLUTE)
+                .right(16.0f)
+                .bottom(16.0f)
+                .width(240.0f)
+                .height(64.0f)
+                .padding(8.0f, 12.0f)
+                .overflow(Overflow.HIDDEN));
+        networkStatusBoxRef[0] = networkStatusBox;
+
+        networkStatusBox.renderer((draw, w) -> {
+            RectView b = w.layoutBounds();
+            float bx = b.x();
+            float by = b.y();
+            float bw = b.width();
+            float bh = b.height();
+
+            var stage = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.stage();
+            int cur = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.current();
+            int tot = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.total();
+            String detail = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.detail();
+            long elapsed = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.elapsedMillis();
+
+            // Сглаживаем прогресс-бар
+            float target = tot > 0 ? (float) cur / tot : 0.0f;
+            progressAnimRef[0] += (target - progressAnimRef[0]) * 0.15f;
+
+            float pad = 12.0f;
+            float cx = bx + pad;
+            float cy = by + 8.0f;
+            float cw = bw - pad * 2.0f;
+
+            // Заголовок этапа
+            draw.addText(stage.displayName(), cx, cy, cw, 16.0f,
+                    new MutableColor(0.95f, 0.85f, 0.40f, 1.0f));
+            cy += 20.0f;
+
+            // Прогресс-бар
+            float barH = 10.0f;
+            draw.addRectFilled(cx, cy, cw, barH, 3.0f, new MutableColor(0.10f, 0.12f, 0.16f, 0.95f));
+            float fillW = Math.max(0.0f, cw * progressAnimRef[0]);
+            if (fillW > 0.5f) {
+                draw.addRectFilled(cx, cy, fillW, barH, 3.0f, new MutableColor(0.30f, 0.75f, 0.95f, 0.95f));
+            }
+            draw.addRect(cx, cy, cw, barH, 3.0f, new MutableColor(0.40f, 0.50f, 0.65f, 0.75f), 1.0f);
+            cy += barH + 5.0f;
+
+            // Счётчик и время
+            String counter = tot > 0 ? (cur + " / " + tot) : "";
+            String timeStr = String.format(Locale.ROOT, "%.1fс", elapsed / 1000.0);
+            draw.addText(counter + "   " + timeStr, cx, cy, cw, 14.0f,
+                    new MutableColor(0.78f, 0.82f, 0.88f, 0.95f));
+
+            // Деталь справа (например "450м")
+            if (!detail.isEmpty()) {
+                draw.addText(detail, cx, cy, cw, 14.0f, new MutableColor(0.55f, 0.70f, 0.85f, 0.90f));
+            }
+        });
+
+        // Индикатор виден только пока генерация идёт
+        boolean ready;
+        if (minecraft.getSingleplayerServer() != null && minecraft.level != null) {
+            ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+            ready = sLevel != null && dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer.isNetworkReady(sLevel);
+        } else {
+            ready = true;
+        }
+
+        networkStatusBox.visible(!ready);
+        activeNetworkStatusBox = networkStatusBox;
+
+        // Подсказка при наведении: подробности прогресса
+        Tooltip progressTooltip = new Tooltip(networkStatusBox, "");
+        progressTooltip.background().set(0.08f, 0.09f, 0.12f, 0.96f);
+        progressTooltip.borderColor().set(0.30f, 0.75f, 0.95f, 0.90f);
+        progressTooltip.radius(4.0f);
+        progressTooltip.borderWidth(1.2f);
+        progressTooltip.offset(6.0f, 6.0f);
+        progressTooltip.maxWidth(320.0f);
+        networkStatusBox.on(PointerEnteredEvent.TYPE, e -> {
+            progressTooltip.richText(buildProgressTooltip());
+            progressTooltip.invalidate(InvalidationFlags.LAYOUT | InvalidationFlags.VISUAL);
+        });
+        rootOverlay.addOverlay(progressTooltip);
+
+        uiLayer.addOverlay(networkStatusBox);
+
         return rootOverlay;
+    }
+
+    /**
+     * Формирует rich-текст подсказки прогресса генерации сети.
+     */
+    private static RichText buildProgressTooltip() {
+        var stage = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.stage();
+        int cur = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.current();
+        int tot = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.total();
+        String detail = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.detail();
+        int percent = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.percent();
+        long elapsed = dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.elapsedMillis();
+
+        RichText.Builder builder = RichText.builder();
+        builder.color(new MutableColor(0.95f, 0.85f, 0.40f, 1.0f))
+               .append("Генерация дорожной сети\n");
+        builder.color(new MutableColor(0.80f, 0.82f, 0.85f, 1.0f))
+               .append("Этап: ").append(stage.displayName()).append("\n");
+        builder.color(new MutableColor(0.40f, 0.75f, 1.0f, 1.0f))
+               .append("Прогресс: " + percent + "%\n");
+        if (tot > 0) {
+            builder.color(new MutableColor(0.70f, 0.72f, 0.75f, 1.0f))
+                   .append("Шаги: " + cur + " / " + tot + "\n");
+        }
+        if (!detail.isEmpty()) {
+            builder.color(new MutableColor(0.55f, 0.70f, 0.85f, 1.0f))
+                   .append("Текущий: " + detail + "\n");
+        }
+        builder.color(new MutableColor(0.70f, 0.72f, 0.75f, 1.0f))
+               .append(String.format(Locale.ROOT, "Прошло: %.1f с", elapsed / 1000.0));
+        return builder.build();
     }
 
     /**
@@ -1455,7 +1658,7 @@ public class TestMap {
             Optional<KnotProductionComponent> prodOpt,
             Optional<TownPortComponent> portOpt,
             Optional<KnotRoutesComponent> routesOpt) {
-        BlockPos pos = meta.pos.get();
+        BlockPos pos = meta.position.get();
         String name = meta.name.get();
         KnotType type = meta.type.get();
         boolean invested = connOpt.map(c -> c.isInvested.get()).orElse(false);
@@ -1484,6 +1687,10 @@ public class TestMap {
         builder.color(new MutableColor(0.40f, 0.75f, 1.0f, 1.0f))
                .append("Type: " + typeName + "\n");
 
+        // DEBUG: UUID узла (темно-серый, мелкий шрифт)
+        builder.color(new MutableColor(0.55f, 0.55f, 0.55f, 1.0f))
+               .append("UUID: " + meta.uuid.get().toString().substring(0, 8) + "...\n");
+
         // Если узел является морским портом
         if (portOpt != null && portOpt.isPresent()) {
             BlockPos pier = portOpt.get().pierPos.get();
@@ -1510,6 +1717,19 @@ public class TestMap {
             int routesCount = routesOpt.get().routes.get().size();
             builder.color(new MutableColor(0.85f, 0.75f, 0.40f, 1.0f))
                    .append("Physical Routes: " + routesCount + "\n");
+            
+            // DEBUG: Показать детали маршрутов
+            var routes = routesOpt.get().routes.get();
+            for (int i = 0; i < Math.min(routes.size(), 3); i++) {
+                var route = routes.get(i);
+                builder.color(new MutableColor(0.65f, 0.65f, 0.65f, 1.0f))
+                       .append(String.format(Locale.ROOT, "  Route #%d: %d waypoints, %.0fm\n",
+                               i + 1, route.waypoints().size(), route.distance()));
+            }
+            if (routes.size() > 3) {
+                builder.color(new MutableColor(0.55f, 0.55f, 0.55f, 1.0f))
+                       .append("  ... and " + (routes.size() - 3) + " more\n");
+            }
         }
 
         // Подсказка действия
@@ -1792,7 +2012,8 @@ public class TestMap {
                 if (sLevel != null) {
                     ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
                     RandomState state = sLevel.getChunkSource().randomState();
-                    RouteGenerator.connectKnotsAsync(objA, objB, gen, sLevel, state);
+                    WorldObjectManager mgr = WorldObjectManagerApi.getManager(sLevel);
+                    RouteGenerator.connectKnotsAsync(objA, objB, gen, sLevel, state, mgr);
                 }
             } catch (Throwable ignored) {
             }
@@ -1808,13 +2029,43 @@ public class TestMap {
     private static List<PseudoEdge> buildPseudoEdges(List<WorldObject> knots) {
         if (knots == null || knots.size() < 2) return List.of();
 
-        List<KnotNetworkGraph.GraphEdge> topology = KnotNetworkGraph.calculateTopology(knots);
+        // Используем РЕАЛЬНЫЕ связи из KnotConnectionComponent.neighbors вместо calculateTopology
+        // Это гарантирует, что отображаются только соединения через промежуточные узлы
         List<PseudoEdge> edges = new ArrayList<>();
+        Set<String> processedPairs = new HashSet<>();
+        
+        Map<UUID, WorldObject> knotMap = new HashMap<>();
+        for (WorldObject obj : knots) {
+            knotMap.put(obj.id(), obj);
+        }
 
-        for (KnotNetworkGraph.GraphEdge edge : topology) {
-            BlockPos pA = edge.a().getSingle(KnotMetaComponent.class).get().pos.get();
-            BlockPos pB = edge.b().getSingle(KnotMetaComponent.class).get().pos.get();
-            edges.add(createPseudoEdge(edge.a(), edge.b(), pA, pB, edge.distance()));
+        for (WorldObject objA : knots) {
+            Optional<KnotMetaComponent> metaA = objA.getSingle(KnotMetaComponent.class);
+            Optional<KnotConnectionComponent> connA = objA.getSingle(KnotConnectionComponent.class);
+            if (metaA.isEmpty() || connA.isEmpty()) continue;
+            
+            BlockPos pA = metaA.get().position.get();
+            
+            for (UUID neighborId : connA.get().neighbors.get()) {
+                // Избегаем дублирования (A-B и B-A)
+                String pairKey = objA.id().compareTo(neighborId) < 0 
+                    ? objA.id() + "_" + neighborId 
+                    : neighborId + "_" + objA.id();
+                
+                if (processedPairs.contains(pairKey)) continue;
+                processedPairs.add(pairKey);
+                
+                WorldObject objB = knotMap.get(neighborId);
+                if (objB == null) continue;
+                
+                Optional<KnotMetaComponent> metaB = objB.getSingle(KnotMetaComponent.class);
+                if (metaB.isEmpty()) continue;
+                
+                BlockPos pB = metaB.get().position.get();
+                double distance = Math.hypot(pA.getX() - pB.getX(), pA.getZ() - pB.getZ());
+                
+                edges.add(createPseudoEdge(objA, objB, pA, pB, distance));
+            }
         }
 
         return edges;
@@ -2070,7 +2321,7 @@ public class TestMap {
 
         KnotMetaComponent meta = town.getSingle(KnotMetaComponent.class).orElse(null);
         if (meta == null) return;
-        BlockPos pos = meta.pos.get();
+        BlockPos pos = meta.position.get();
         float worldX = (float) pos.getX();
         float worldY = (float) pos.getZ();
 
@@ -2152,7 +2403,7 @@ public class TestMap {
 
         KnotMetaComponent meta = currentSelectedTown.getSingle(KnotMetaComponent.class).orElse(null);
         if (meta == null) return;
-        BlockPos townPos = meta.pos.get();
+        BlockPos townPos = meta.position.get();
         float townX = (float) townPos.getX();
         float townZ = (float) townPos.getZ();
 
@@ -2199,7 +2450,7 @@ public class TestMap {
 
         KnotMetaComponent meta = town.getSingle(KnotMetaComponent.class).orElse(null);
         if (meta == null) return;
-        BlockPos pos = meta.pos.get();
+        BlockPos pos = meta.position.get();
 
         activeLeftContent.clearChildren();
 
@@ -2573,8 +2824,11 @@ public class TestMap {
         }
 
         for (WorldObject knot : matched) {
-            KnotMetaComponent meta = knot.getSingle(KnotMetaComponent.class).get();
-            BlockPos pos = meta.pos.get();
+            Optional<KnotMetaComponent> metaOpt = knot.getSingle(KnotMetaComponent.class);
+            if (metaOpt.isEmpty()) continue;
+            
+            KnotMetaComponent meta = metaOpt.get();
+            BlockPos pos = meta.position.get();
             boolean isTown = (meta.type.get() == KnotType.TOWN);
             String prefix = isTown ? "🏰 " : "📍 ";
             String labelText = prefix + meta.name.get() + " [" + pos.getX() + ", " + pos.getZ() + "]";

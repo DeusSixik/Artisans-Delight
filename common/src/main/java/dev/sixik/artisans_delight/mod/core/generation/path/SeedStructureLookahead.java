@@ -147,8 +147,9 @@ public final class SeedStructureLookahead {
                         continue; // Водоём, суши нет
                     }
 
-                    // 3. Проверяем, нет ли уже зарегистрированного узла рядом
-                    if (hasNearbyKnot(manager, candBlockX, candBlockZ, 128.0)) {
+                    // 3. Проверяем, нет ли уже зарегистрированного узла рядом.
+                    // WAYPOINT-развилки игнорируем: они не деревни и не должны блокировать предикт поселений.
+                    if (hasNearbyTownKnot(manager, candBlockX, candBlockZ, 128.0)) {
                         continue;
                     }
 
@@ -189,12 +190,36 @@ public final class SeedStructureLookahead {
         for (WorldObject obj : manager.all()) {
             Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
             if (mOpt.isPresent()) {
-                BlockPos pos = mOpt.get().pos.get();
+                BlockPos pos = mOpt.get().position.get();
                 double dx = pos.getX() - blockX;
                 double dz = pos.getZ() - blockZ;
                 if (dx * dx + dz * dz <= maxDistSq) {
                     return true;
                 }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Проверка наличия рядом только «настоящих» узлов (TOWN/PRODUCTION/OUTPOST).
+     * WAYPOINT-развилки от {@link JunctionEngine} игнорируются: это служебные точки
+     * схождения дорог, а не поселения, и они не должны блокировать предикт деревень
+     * или считаться промежуточными в топологии.
+     */
+    public static boolean hasNearbyTownKnot(WorldObjectManager manager, int blockX, int blockZ, double maxDist) {
+        if (manager == null) return false;
+        double maxDistSq = maxDist * maxDist;
+
+        for (WorldObject obj : manager.all()) {
+            Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
+            if (mOpt.isEmpty()) continue;
+            if (mOpt.get().type.get() == KnotType.WAYPOINT) continue;
+            BlockPos pos = mOpt.get().position.get();
+            double dx = pos.getX() - blockX;
+            double dz = pos.getZ() - blockZ;
+            if (dx * dx + dz * dz <= maxDistSq) {
+                return true;
             }
         }
         return false;
@@ -209,15 +234,17 @@ public final class SeedStructureLookahead {
 
         for (WorldObject obj : manager.all()) {
             Optional<KnotMetaComponent> mOpt = obj.getSingle(KnotMetaComponent.class);
-            if (mOpt.isPresent()) {
-                BlockPos kPos = mOpt.get().pos.get();
-                double dx = kPos.getX() - pos.getX();
-                double dz = kPos.getZ() - pos.getZ();
-                double distSq = dx * dx + dz * dz;
-                if (distSq <= maxDistSq && distSq < closestDistSq) {
-                    closestDistSq = distSq;
-                    closest = obj;
-                }
+            if (mOpt.isEmpty()) continue;
+            // WAYPOINT-развилки — служебные точки схождения дорог, а не поселения:
+            // структура деревни никогда не должна сливаться с развилкой.
+            if (mOpt.get().type.get() == KnotType.WAYPOINT) continue;
+            BlockPos kPos = mOpt.get().position.get();
+            double dx = kPos.getX() - pos.getX();
+            double dz = kPos.getZ() - pos.getZ();
+            double distSq = dx * dx + dz * dz;
+            if (distSq <= maxDistSq && distSq < closestDistSq) {
+                closestDistSq = distSq;
+                closest = obj;
             }
         }
         return Optional.ofNullable(closest);
