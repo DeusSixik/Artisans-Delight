@@ -46,13 +46,20 @@ import java.util.UUID;
  *       (мосты, обход воды). Прямая линия — только fallback.</li>
  * </ol>
  *
- * <p><b>Детерминированность:</b> при тех же городах и сиде результат
- * побитово тот же (id городов — от сида+позиции, порядок узлов — от MST,
- * рандом — от сида+хэшей id).
+ * <p><b>Параллелизм:</b> этапы цепочек и геометрии считаются в пуле
+ * {@code CALC_THREADS} (по рёбрам/сегментам — они независимы). Нумерация узлов
+ * двухпроходная через префиксные суммы, поэтому результат побитово совпадает
+ * с однопоточным расчётом. Пул создаётся на расчёт и закрывается после.
  */
 public final class RoadNetworkBuilder {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RoadNetworkBuilder.class);
+
+    /**
+     * Размер пула для параллельного расчёта рёбер.
+     * Рёбра MST независимы: своя грубая дорога, свои узлы, своя геометрия.
+     */
+    private static final int CALC_THREADS = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
 
     private RoadNetworkBuilder() {
     }
@@ -120,48 +127,32 @@ public final class RoadNetworkBuilder {
         List<TownSeed[]> mstEdges = calculateMst(townList);
         LOGGER.info("[RoadNetworkBuilder] MST построен: {} рёбер для {} городов", mstEdges.size(), townList.size());
 
-        // 2. Цепочки узлов + соседства (топология)
-        // key ребра -> упорядоченная цепочка id узлов (включая оба города)
-        List<List<UUID>> chains = new ArrayList<>();
-        int waypointIndex = 0;
-        for (int i = 0; i < mstEdges.size(); i++) {
-            TownSeed a = mstEdges.get(i)[0];
-            TownSeed b = mstEdges.get(i)[1];
-            GenerationProgress.setProgress(i + 1, mstEdges.size(), a.name() + " -> " + b.name());
+        // 2. Цепочки узлов ПАРАЛЛЕЛЬНО (по рёбрам MST).
+        // Каждое ребро независимо: своя грубая дорога и свои узлы.
+        // Нумерация waypoints — двухпроходная (см. ниже), чтобы id остались
+        // последовательными и детерминированными, как при однопотоке.
+        java.util.concurrent.ExecutorService calcPool = java.util.concurrent.Executors.newFixedThreadPool(
+            CALC_THREADS, r -> {
+                Thread t = new Thread(r, "ArtisansDelight-RoadCalc");
+                t.setDaemon(true);
+                return t;
+            });
+        try {
+            List<List<UUID>> chains = buildChainsParallel(
+                mstEdges, worldSeed, generator, height, randomState, nodes, calcPool);
 
-            ChainResult chain = createNodeChain(a, b, nodes, worldSeed, generator, height, randomState, waypointIndex);
-            waypointIndex += chain.newWaypoints();
-            if (chain.nodeIds().size() >= 2) {
-                chains.add(chain.nodeIds());
-            }
+            // 3. Геометрия каждого сегмента цепочки ПАРАЛЛЕЛЬНО.
+            Map<String, RoadEdge> edges = buildEdgesParallel(
+                chains, nodes, worldSeed, generator, height, randomState, calcPool);
+
+            GenerationProgress.finish();
+            RoadNetwork network = new RoadNetwork(worldSeed, nodes, edges);
+            LOGGER.info("[RoadNetworkBuilder] Сеть посчитана (потоков: {}): {} узлов, {} рёбер",
+                CALC_THREADS, network.nodeCount(), network.edgeCount());
+            return network;
+        } finally {
+            calcPool.shutdownNow();
         }
-
-        // 3. Геометрия каждого сегмента цепочки
-        GenerationProgress.setStage(GenerationProgress.Stage.FINE_GEOMETRY);
-        Map<String, RoadEdge> edges = new LinkedHashMap<>();
-        int totalSegments = 0;
-        for (List<UUID> chain : chains) {
-            totalSegments += chain.size() - 1;
-        }
-        int doneSegments = 0;
-        for (List<UUID> chain : chains) {
-            for (int i = 0; i < chain.size() - 1; i++) {
-                RoadNode from = nodes.get(chain.get(i));
-                RoadNode to = nodes.get(chain.get(i + 1));
-                if (from == null || to == null) continue;
-
-                doneSegments++;
-                RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
-                edges.put(edge.key(), edge);
-                GenerationProgress.setProgress(doneSegments, totalSegments, (int) edge.distance() + "м");
-            }
-        }
-
-        GenerationProgress.finish();
-        RoadNetwork network = new RoadNetwork(worldSeed, nodes, edges);
-        LOGGER.info("[RoadNetworkBuilder] Сеть посчитана: {} узлов, {} рёбер",
-            network.nodeCount(), network.edgeCount());
-        return network;
     }
 
     // =========================================================================
@@ -204,21 +195,95 @@ public final class RoadNetworkBuilder {
         return Math.sqrt(dx * dx + dz * dz);
     }
 
-    private record ChainResult(List<UUID> nodeIds, int newWaypoints) {
+
+    /**
+     * Координаты промежуточных узлов одного ребра MST (без id).
+     * Id назначаются позже через префиксные суммы, чтобы нумерация осталась
+     * последовательной и детерминированной при параллельном расчёте.
+     */
+    private record ChainCoords(List<int[]> waypointCoords, boolean hasRoad) {
     }
 
     /**
-     * Создаёт цепочку промежуточных узлов между двумя городами вдоль грубой дороги.
-     * Логика — 1:1 из {@code CoarseGraphBuilder.createNodeChain}.
+     * Строит цепочки всех рёбер MST параллельно.
+     *
+     * <p>Проход 1 (параллельно): координаты узлов каждого ребра.
+     * Проход 2 (последовательно, дёшево): префиксные суммы → глобальные индексы →
+     * финальные {@link RoadNode} с теми же id, что дал бы однопоток.
      */
-    private static ChainResult createNodeChain(TownSeed townA,
-                                               TownSeed townB,
-                                               Map<UUID, RoadNode> nodes,
-                                               long worldSeed,
-                                               ChunkGenerator generator,
-                                               LevelHeightAccessor height,
-                                               RandomState randomState,
-                                               int startIndex) {
+    private static List<List<UUID>> buildChainsParallel(List<TownSeed[]> mstEdges,
+                                                        long worldSeed,
+                                                        ChunkGenerator generator,
+                                                        LevelHeightAccessor height,
+                                                        RandomState randomState,
+                                                        Map<UUID, RoadNode> nodes,
+                                                        java.util.concurrent.ExecutorService pool) {
+        int n = mstEdges.size();
+        List<java.util.concurrent.Future<ChainCoords>> futures = new ArrayList<>(n);
+        java.util.concurrent.atomic.AtomicInteger doneChains = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        for (int i = 0; i < n; i++) {
+            final TownSeed a = mstEdges.get(i)[0];
+            final TownSeed b = mstEdges.get(i)[1];
+            futures.add(pool.submit(() -> {
+                ChainCoords coords = computeChainCoords(a, b, worldSeed, generator, height, randomState);
+                int done = doneChains.incrementAndGet();
+                GenerationProgress.setProgress(done, n, a.name() + " -> " + b.name());
+                return coords;
+            }));
+        }
+
+        // Собираем результаты в порядке рёбер MST (детерминированно)
+        List<ChainCoords> allCoords = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            try {
+                allCoords.add(futures.get(i).get());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Chain calc interrupted", e);
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new RuntimeException("Chain calc failed", e.getCause());
+            }
+        }
+
+        // Проход 2: префиксные суммы и финальные узлы
+        List<List<UUID>> chains = new ArrayList<>();
+        int waypointIndex = 0;
+        for (int i = 0; i < n; i++) {
+            TownSeed a = mstEdges.get(i)[0];
+            TownSeed b = mstEdges.get(i)[1];
+            ChainCoords coords = allCoords.get(i);
+            if (!coords.hasRoad()) continue;
+
+            List<UUID> chain = new ArrayList<>();
+            chain.add(a.id());
+            int local = 0;
+            for (int[] c : coords.waypointCoords()) {
+                local++;
+                int index = waypointIndex + local;
+                UUID nodeId = waypointId(worldSeed, index);
+                RoadNode node = new RoadNode(nodeId, RoadNode.Kind.WAYPOINT,
+                    "Перекрёсток #" + index, c[0], c[1], c[2]);
+                nodes.put(nodeId, node);
+                chain.add(nodeId);
+            }
+            waypointIndex += coords.waypointCoords().size();
+            chain.add(b.id());
+            chains.add(chain);
+        }
+        return chains;
+    }
+
+    /**
+     * Тяжёлая часть цепочки: грубая дорога + координаты узлов. Без id, без записи.
+     * Потокобезопасна: только локальные данные + чтение генератора/кэшей.
+     */
+    private static ChainCoords computeChainCoords(TownSeed townA,
+                                                  TownSeed townB,
+                                                  long worldSeed,
+                                                  ChunkGenerator generator,
+                                                  LevelHeightAccessor height,
+                                                  RandomState randomState) {
         ObjectList<RoadPoint2D> roadPath = CoarsePathfinder.findCoarseLandRoad(
             generator, height, randomState,
             townA.x(), townA.z(), townB.x(), townB.z(),
@@ -228,7 +293,7 @@ public final class RoadNetworkBuilder {
         if (roadPath.isEmpty()) {
             LOGGER.warn("[RoadNetworkBuilder] Нет сухопутной дороги '{}' -> '{}', пропускаю",
                 townA.name(), townB.name());
-            return new ChainResult(List.of(), 0);
+            return new ChainCoords(List.of(), false);
         }
 
         double roadLength = 0.0;
@@ -247,9 +312,7 @@ public final class RoadNetworkBuilder {
             nodeCount = minNodes + random.nextInt(maxNodes - minNodes + 1);
         }
 
-        List<UUID> chain = new ArrayList<>();
-        chain.add(townA.id());
-
+        List<int[]> coords = new ArrayList<>(nodeCount);
         for (int i = 1; i <= nodeCount; i++) {
             double segLen = roadLength / (nodeCount + 1);
             double margin = segLen * 0.15;
@@ -285,22 +348,69 @@ public final class RoadNetworkBuilder {
             if (waypointPos == null) {
                 waypointPos = new BlockPos(x, townA.y(), z);
             }
-
-            int index = startIndex + i;
-            UUID nodeId = waypointId(worldSeed, index);
-            RoadNode node = new RoadNode(nodeId, RoadNode.Kind.WAYPOINT,
-                "Перекрёсток #" + index, waypointPos.getX(), waypointPos.getY(), waypointPos.getZ());
-            nodes.put(nodeId, node);
-            chain.add(nodeId);
+            coords.add(new int[]{waypointPos.getX(), waypointPos.getY(), waypointPos.getZ()});
         }
-
-        chain.add(townB.id());
-        return new ChainResult(chain, nodeCount);
+        return new ChainCoords(coords, true);
     }
 
     // =========================================================================
-    // Геометрия сегмента
+    // Геометрия сегментов (параллельно)
     // =========================================================================
+
+    /**
+     * Строит геометрию всех сегментов цепочек параллельно.
+     *
+     * <p>Сегменты независимы: каждый читает только координаты своих концов.
+     * Результаты собираются в порядке цепочек (детерминированный порядок рёбер).
+     */
+    private static Map<String, RoadEdge> buildEdgesParallel(List<List<UUID>> chains,
+                                                            Map<UUID, RoadNode> nodes,
+                                                            long worldSeed,
+                                                            ChunkGenerator generator,
+                                                            LevelHeightAccessor height,
+                                                            RandomState randomState,
+                                                            java.util.concurrent.ExecutorService pool) {
+        GenerationProgress.setStage(GenerationProgress.Stage.FINE_GEOMETRY);
+
+        // Плоский список сегментов (fromId/toId) в детерминированном порядке
+        List<UUID[]> segments = new ArrayList<>();
+        for (List<UUID> chain : chains) {
+            for (int i = 0; i < chain.size() - 1; i++) {
+                segments.add(new UUID[]{chain.get(i), chain.get(i + 1)});
+            }
+        }
+
+        int total = segments.size();
+        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger(0);
+        List<java.util.concurrent.Future<RoadEdge>> futures = new ArrayList<>(total);
+        for (UUID[] seg : segments) {
+            final RoadNode from = nodes.get(seg[0]);
+            final RoadNode to = nodes.get(seg[1]);
+            futures.add(pool.submit(() -> {
+                RoadEdge edge = (from == null || to == null) ? null
+                    : buildEdge(from, to, worldSeed, generator, height, randomState);
+                int d = done.incrementAndGet();
+                GenerationProgress.setProgress(d, total, edge != null ? ((int) edge.distance() + "м") : "?");
+                return edge;
+            }));
+        }
+
+        Map<String, RoadEdge> edges = new LinkedHashMap<>();
+        for (java.util.concurrent.Future<RoadEdge> f : futures) {
+            try {
+                RoadEdge edge = f.get();
+                if (edge != null) {
+                    edges.put(edge.key(), edge);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Edge calc interrupted", e);
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new RuntimeException("Edge calc failed", e.getCause());
+            }
+        }
+        return edges;
+    }
 
     private static RoadEdge buildEdge(RoadNode from,
                                       RoadNode to,

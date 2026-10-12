@@ -150,6 +150,28 @@ public class TestMap {
     private static final Set<UUID> activeKnotMarkerIds = new HashSet<>();
     // Ревизия виртуальной сети, для которой построены маркеры (см. RoadNetworkStore)
     private static long lastMarkerNetworkRevision = -1L;
+    // Сид мира открытой карты (для детерминированных id городов до публикации сети)
+    private static long activeWorldSeed = 0L;
+
+    /**
+     * Сид мира, в котором открыта карта (0 — неизвестен).
+     * Используется для детерминированных id городских маркеров, чтобы id маркера
+     * совпадал с id узла города в будущей опубликованной сети.
+     */
+    private static long currentWorldSeed() {
+        if (activeWorldSeed != 0L) return activeWorldSeed;
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.getSingleplayerServer() != null && mc.level != null) {
+                ServerLevel sl = mc.getSingleplayerServer().getLevel(mc.level.dimension());
+                if (sl != null) {
+                    activeWorldSeed = sl.getChunkSource().getGeneratorState().getLevelSeed();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return activeWorldSeed;
+    }
     private static Box activeCpBar;
     private static Label activeCpLabel;
     private static Tooltip activeCpTooltip;
@@ -375,6 +397,7 @@ public class TestMap {
                 activeProgressTooltip = null;
                 activeKnotMarkerIds.clear();
                 lastMarkerNetworkRevision = -1L;
+                activeWorldSeed = 0L;
                 Minecraft.getInstance().setScreen(previous);
             }
 
@@ -421,26 +444,15 @@ public class TestMap {
             }
 
             /**
-             * Сверяет маркеры с текущей виртуальной сетью и добавляет недостающие.
-             * При новой ревизии сети старые маркеры сносятся и строятся заново
-             * (топология могла полностью измениться).
+             * Сверяет маркеры с городами менеджера и виртуальной сетью.
+             *
+             * <p>Города добавляются СРАЗУ из менеджера (видны во время расчёта сети).
+             * Перекрёстки — после публикации сети. При новой ревизии сети якоря
+             * перекрёстков сносятся и строятся заново (городские не трогаем —
+             * они привязаны к живым объектам, а не к ревизии).
              */
             private void syncMarkersWithNetwork() {
-                dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork net =
-                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.current();
-                if (net == null) return;
-
-                long rev = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.revision();
-                if (rev != lastMarkerNetworkRevision) {
-                    // Новая сеть: удаляем все старые якоря узлов и строим заново
-                    for (UUID id : new java.util.HashSet<>(activeKnotMarkerIds)) {
-                        activeCanvas.anchorLayer().remove("knot_" + id);
-                    }
-                    activeKnotMarkerIds.clear();
-                    lastMarkerNetworkRevision = rev;
-                }
-
-                // Карта sourceId города -> игровой объект
+                // Карта id игрового объекта города -> объект
                 Map<UUID, WorldObject> townObjects = new HashMap<>();
                 if (activeMapManager != null) {
                     for (WorldObject obj : activeMapManager.all()) {
@@ -451,10 +463,52 @@ public class TestMap {
                     }
                 }
 
+                // 1. Города из менеджера — всегда (даже до готовности сети)
+                if (!townObjects.isEmpty()) {
+                    long seed = currentWorldSeed();
+                    for (WorldObject townObj : townObjects.values()) {
+                        Optional<KnotMetaComponent> mOpt = townObj.getSingle(KnotMetaComponent.class);
+                        if (mOpt.isEmpty()) continue;
+                        BlockPos pos = mOpt.get().position.get();
+                        if (pos == null) continue;
+                        UUID virtualId = (seed != 0L)
+                                ? dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.townId(
+                                        seed, pos.getX(), pos.getZ())
+                                : townObj.id();
+                        if (activeKnotMarkerIds.contains(virtualId)) continue;
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode cityNode =
+                                new dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode(
+                                        virtualId,
+                                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode.Kind.TOWN,
+                                        mOpt.get().name.get(), pos.getX(), pos.getY(), pos.getZ(), townObj.id());
+                        addKnotMarker(activeCanvas, activeRootOverlay, cityNode, townObj);
+                    }
+                }
+
+                // 2. Перекрёстки из виртуальной сети (после публикации)
+                dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork net =
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.current();
+                if (net == null) return;
+
+                long rev = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.revision();
+                if (rev != lastMarkerNetworkRevision) {
+                    // Новая сеть: сносим только якоря перекрёстков (городские остаются)
+                    for (UUID id : new java.util.HashSet<>(activeKnotMarkerIds)) {
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode n = net.node(id);
+                        // узел уже не в сети ИЛИ это перекрёсток — удалить;
+                        // города из сети пропускаем (их маркеры созданы в шаге 1 с тем же id)
+                        if (n == null || !n.isTown()) {
+                            activeCanvas.anchorLayer().remove("knot_" + id);
+                            activeKnotMarkerIds.remove(id);
+                        }
+                    }
+                    lastMarkerNetworkRevision = rev;
+                }
+
                 for (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode node : net.nodes()) {
+                    if (node.isTown()) continue; // города уже созданы в шаге 1
                     if (activeKnotMarkerIds.contains(node.id())) continue;
-                    WorldObject townObj = (node.sourceId() != null) ? townObjects.get(node.sourceId()) : null;
-                    addKnotMarker(activeCanvas, activeRootOverlay, node, townObj);
+                    addKnotMarker(activeCanvas, activeRootOverlay, node, null);
                 }
             }
 
@@ -875,73 +929,73 @@ public class TestMap {
 
             // === 5. (УДАЛЕНО: псевдо-линии дублировали реальные рёбра раздела 4) ===
 
-            // === 6. ОРЕОЛЫ УЗЛОВ (виртуальная сеть + города из менеджера) ===
-            // Города: живые объекты из менеджера (инвестиции, порты, выбор города).
-            // Перекрёстки: виртуальные узлы сети.
+            // === 6. ОРЕОЛЫ УЗЛОВ ===
+            // Города рисуются ВСЕГДА из менеджера (видны даже во время расчёта сети).
+            // Перекрёстки — из виртуальной сети после её публикации.
+
+            // 6a. Города из менеджера (не зависят от готовности сети)
+            for (WorldObject townObj : townObjects.values()) {
+                Optional<KnotMetaComponent> mOpt = townObj.getSingle(KnotMetaComponent.class);
+                if (mOpt.isEmpty()) continue;
+                BlockPos pos = mOpt.get().position.get();
+                if (pos == null) continue;
+
+                float kx = world.worldToRootX((float) pos.getX());
+                float ky = world.worldToRootY((float) pos.getZ());
+                boolean inv = townObj.getSingle(KnotConnectionComponent.class)
+                        .map(c -> c.isInvested.get()).orElse(false);
+
+                MutableColor haloColor = inv
+                        ? new MutableColor(1.0f, 0.82f, 0.22f, 0.65f)
+                        : new MutableColor(0.25f, 0.55f, 0.95f, 0.55f);
+
+                // Зона юрисдикции города (отображается вокруг города)
+                float zoneRadius = 45.0f * world.viewport().zoom();
+                draw.addCircle(kx, ky, zoneRadius,
+                        new MutableColor(0.25f, 0.65f, 1.0f, 0.30f), 32, 1.5f);
+                draw.addCircleFilled(kx, ky, zoneRadius,
+                        new MutableColor(0.20f, 0.55f, 0.90f, 0.06f), 32);
+
+                if (currentSelectedTown == townObj) {
+                    // Граница ограничения камеры (3 чанка = 48 блоков вокруг центра)
+                    float limitRadius = TOWN_PAN_LIMIT * world.viewport().zoom();
+                    draw.addCircle(kx, ky, limitRadius,
+                            new MutableColor(1.0f, 0.85f, 0.30f, 0.75f), 48, 2.0f);
+                    draw.addCircleFilled(kx, ky, limitRadius,
+                            new MutableColor(1.0f, 0.80f, 0.20f, 0.05f), 48);
+                }
+
+                // Если город прибрежный (порт) - рисуем маркер причала у воды
+                Optional<TownPortComponent> portOpt = townObj.getSingle(TownPortComponent.class);
+                if (portOpt.isPresent()) {
+                    BlockPos pier = portOpt.get().pierPos.get();
+                    float px = world.worldToRootX((float) pier.getX());
+                    float py = world.worldToRootY((float) pier.getZ());
+
+                    // Причал / верфь на берегу
+                    draw.addCircleFilled(px, py, 5.0f, new MutableColor(0.20f, 0.85f, 0.95f, 0.85f), 12);
+                    draw.addCircle(px, py, 7.5f, new MutableColor(1.0f, 1.0f, 1.0f, 0.70f), 12, 1.2f);
+
+                    // Пунктирный съезд от центра поселения к причалу
+                    drawDashedLine(draw, kx, ky, px, py, new MutableColor(0.30f, 0.80f, 0.95f, 0.50f), 1.5f, 4.0f, 3.0f);
+                }
+
+                // Город — стандартный большой маркер
+                draw.addCircleFilled(kx, ky, 7.0f, haloColor, 16);
+                draw.addCircle(kx, ky, 10.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.50f), 16, 1.5f);
+            }
+
+            // 6b. Перекрёстки из виртуальной сети (после публикации)
             if (virtualNetwork != null) {
                 for (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode node : virtualNetwork.nodes()) {
+                    if (node.isTown()) continue; // города уже нарисованы выше
                     float kx = world.worldToRootX((float) node.x());
                     float ky = world.worldToRootY((float) node.z());
-                    boolean isTown = node.isTown();
-                    boolean inv = Boolean.TRUE.equals(investedVirtual.get(node.id()));
 
-                    MutableColor haloColor;
-                    if (inv) {
-                        haloColor = new MutableColor(1.0f, 0.82f, 0.22f, 0.65f);
-                    } else if (isTown) {
-                        haloColor = new MutableColor(0.25f, 0.55f, 0.95f, 0.55f);
-                    } else {
-                        // Обычные сухопутные waypoints — зелёные
-                        haloColor = new MutableColor(0.35f, 0.80f, 0.45f, 0.55f);
-                    }
-
-                    WorldObject townObj = (node.sourceId() != null) ? townObjects.get(node.sourceId()) : null;
-
-                    if (isTown) {
-                        // Зона юрисдикции города (отображается вокруг города)
-                        float zoneRadius = 45.0f * world.viewport().zoom();
-                        draw.addCircle(kx, ky, zoneRadius,
-                                new MutableColor(0.25f, 0.65f, 1.0f, 0.30f), 32, 1.5f);
-                        draw.addCircleFilled(kx, ky, zoneRadius,
-                                new MutableColor(0.20f, 0.55f, 0.90f, 0.06f), 32);
-
-                        if (townObj != null && currentSelectedTown == townObj) {
-                            // Граница ограничения камеры (3 чанка = 48 блоков вокруг центра)
-                            float limitRadius = TOWN_PAN_LIMIT * world.viewport().zoom();
-                            draw.addCircle(kx, ky, limitRadius,
-                                    new MutableColor(1.0f, 0.85f, 0.30f, 0.75f), 48, 2.0f);
-                            draw.addCircleFilled(kx, ky, limitRadius,
-                                    new MutableColor(1.0f, 0.80f, 0.20f, 0.05f), 48);
-                        }
-
-                        // Если город прибрежный (порт) - рисуем маркер причала у воды
-                        if (townObj != null) {
-                            Optional<TownPortComponent> portOpt = townObj.getSingle(TownPortComponent.class);
-                            if (portOpt.isPresent()) {
-                                BlockPos pier = portOpt.get().pierPos.get();
-                                float px = world.worldToRootX((float) pier.getX());
-                                float py = world.worldToRootY((float) pier.getZ());
-
-                                // Причал / верфь на берегу
-                                draw.addCircleFilled(px, py, 5.0f, new MutableColor(0.20f, 0.85f, 0.95f, 0.85f), 12);
-                                draw.addCircle(px, py, 7.5f, new MutableColor(1.0f, 1.0f, 1.0f, 0.70f), 12, 1.2f);
-
-                                // Пунктирный съезд от центра поселения к причалу
-                                drawDashedLine(draw, kx, ky, px, py, new MutableColor(0.30f, 0.80f, 0.95f, 0.50f), 1.5f, 4.0f, 3.0f);
-                            }
-                        }
-                    }
-
-                    // Круг-основание под кончиком метки на карте
-                    if (isTown) {
-                        // Город — стандартный большой маркер
-                        draw.addCircleFilled(kx, ky, 7.0f, haloColor, 16);
-                        draw.addCircle(kx, ky, 10.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.50f), 16, 1.5f);
-                    } else {
-                        // Сухопутный waypoint — маленький зелёный кружок
-                        draw.addCircleFilled(kx, ky, 4.0f, haloColor, 12);
-                        draw.addCircle(kx, ky, 6.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.40f), 12, 1.0f);
-                    }
+                    // Сухопутный waypoint — маленький зелёный кружок
+                    MutableColor haloColor = new MutableColor(0.35f, 0.80f, 0.45f, 0.55f);
+                    draw.addCircleFilled(kx, ky, 4.0f, haloColor, 12);
+                    draw.addCircle(kx, ky, 6.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.40f), 12, 1.0f);
                 }
             }
 
