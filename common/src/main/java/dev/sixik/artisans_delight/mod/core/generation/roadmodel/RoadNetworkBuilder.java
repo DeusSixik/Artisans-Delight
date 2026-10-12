@@ -39,11 +39,17 @@ import java.util.UUID;
  *       только суша (вода отсекается), шаг адаптивный 250–400.</li>
  *   <li>Связка узел–узел: кандидаты — соседи в радиусе {@code LINK_RADIUS},
  *       сортировка по длине, лимит степени {@code MAX_DEGREE}, запрет
- *       пересечений отрезков, вероятностный пропуск для ветвлений.</li>
+ *       пересечений отрезков, вероятностный пропуск для ветвлений.
+ *       Узел без соседей в радиусе не оставляется на шансе: ему безусловно
+ *       назначается кратчайшее непересекающееся ребро (топологическая гарантия).</li>
  *   <li>Ветви: waypoint-only компоненты с шансом остаются isolated-ветками,
  *       компоненты с городами всегда пришиваются к главной.</li>
  *   <li>Геометрия каждого ребра — {@code CoarsePathfinder.findLandRoad}.
  *       Нет дороги — ребро отбрасывается (никаких прямых через воду).</li>
+ *   <li>Финальная гарантия: сироты с нулевой степенью после геометрии
+ *       ремонтируются (ближайший сосед с проверенной дорогой, пересечения
+ *       и степень — по возможности), неремонтируемые вырезаются из узлов,
+ *       компоненты с городами сшиваются проверенными мостами.</li>
  * </ol>
  *
  * <p><b>Параллелизм:</b> тяжёлая геометрия считается в пуле
@@ -87,6 +93,10 @@ public final class RoadNetworkBuilder {
     private static final double BRANCH_ATTACH_RADIUS = LINK_RADIUS * 1.5;
     /** Радиус пришивки компонент с городами (города обязаны быть связаны). */
     private static final double TOWN_ATTACH_RADIUS = 3000.0;
+    /** Радиус гарантированного добива сирот после геометрии (второй шанс длиннее обычного). */
+    private static final double ORPHAN_LINK_RADIUS = 1200.0;
+    /** Радиус сшивки изолированных компонент городов после финальной гарантии. */
+    private static final double ORPHAN_TOWN_RADIUS = 3000.0;
     /** Не ставить перекрёсток ближе к городу (убирает скученность у деревень). */
     private static final double TOWN_CLEARANCE = 140.0;
     /** Не ставить перекрёстки ближе друг к другу (убирает дубовые кластеры). */
@@ -187,6 +197,9 @@ public final class RoadNetworkBuilder {
         try {
             Map<String, RoadEdge> edges = buildMeshEdgesParallel(
                 topoPairs, nodes, worldSeed, generator, height, randomState, calcPool);
+
+            // 4. Финальная гарантия: топологическая связность + проверенная геометрия.
+            ensureConnectivity(nodes, edges, townIds, worldSeed, generator, height, randomState);
 
             GenerationProgress.finish();
             RoadNetwork network = new RoadNetwork(worldSeed, nodes, edges);
@@ -353,6 +366,7 @@ public final class RoadNetworkBuilder {
             if (crossesAccepted(c.a(), c.b(), pos, accepted)) {
                 continue;
             }
+            boolean degZero = degA == 0 || degB == 0;
             double keep;
             if (degA < 2 && degB < 2) {
                 keep = 0.95;
@@ -361,9 +375,13 @@ public final class RoadNetworkBuilder {
             } else {
                 keep = LINK_KEEP_PROB * (1.0 - 0.4 * (c.dist() / LINK_RADIUS));
             }
-            Random roll = new Random(worldSeed ^ ((long) c.a().hashCode() * 31L + c.b().hashCode()));
-            if (roll.nextDouble() >= keep) {
-                continue; // Ветвление: пропуск создаёт отростки и отдельные ветки.
+            if (!degZero) {
+                // Ветвление: пропуск создаёт отростки и отдельные ветки.
+                // Но узел со степенью 0 роллу не подлежит — ему нужна хоть одна связь.
+                Random roll = new Random(worldSeed ^ ((long) c.a().hashCode() * 31L + c.b().hashCode()));
+                if (roll.nextDouble() >= keep) {
+                    continue;
+                }
             }
             accepted.add(new UUID[]{c.a(), c.b()});
             degree.put(c.a(), degA + 1);
@@ -476,6 +494,269 @@ public final class RoadNetworkBuilder {
 
     private static double orient(double ax, double ay, double bx, double by, double cx, double cy) {
         return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    }
+
+    // =========================================================================
+    // Финальная гарантия: ремонт сирот и чистка после геометрии
+    // =========================================================================
+
+    /**
+     * Доводит сеть до гарантированного состояния после отброса рёбер без геометрии.
+     *
+     * <p>Проблема: топология приняла ребро (степень поднята), а
+     * {@link #buildEdge} потом вернул {@code null} — узел остаётся сиротой
+     * на карте. Здесь каждый waypoint со степенью 0 получает второй шанс:
+     * ближайший сосед с реально построенной дорогой. Неремонтируемые
+     * перекрёстки вырезаются из узлов. Компоненты с городами сшиваются
+     * проверенными мостами, чтобы города не висели изолированно.
+     */
+    private static void ensureConnectivity(Map<UUID, RoadNode> nodes,
+                                           Map<String, RoadEdge> edges,
+                                           Set<UUID> townIds,
+                                           long worldSeed,
+                                           ChunkGenerator generator,
+                                           LevelHeightAccessor height,
+                                           RandomState randomState) {
+        Map<UUID, Integer> degree = new HashMap<>();
+        for (UUID id : nodes.keySet()) {
+            degree.put(id, 0);
+        }
+        for (RoadEdge e : edges.values()) {
+            degree.put(e.fromId(), degree.getOrDefault(e.fromId(), 0) + 1);
+            degree.put(e.toId(), degree.getOrDefault(e.toId(), 0) + 1);
+        }
+
+        Map<UUID, double[]> pos = new HashMap<>(nodes.size() * 2);
+        for (RoadNode n : nodes.values()) {
+            pos.put(n.id(), new double[]{n.x(), n.z()});
+        }
+
+        // Сироты: перекрёстки со степенью 0. Города не чистим никогда.
+        List<UUID> orphans = new ArrayList<>();
+        for (RoadNode n : nodes.values()) {
+            if (!n.isTown() && degree.getOrDefault(n.id(), 0) == 0) {
+                orphans.add(n.id());
+            }
+        }
+        orphans.sort(Comparator.comparing(UUID::toString));
+
+        List<RoadEdge> liveEdges = new ArrayList<>(edges.values());
+        int repaired = 0;
+        List<UUID> unrepairable = new ArrayList<>();
+        for (UUID orphan : orphans) {
+            RoadEdge fixed = repairOrphan(orphan, townIds, nodes, pos, degree, liveEdges,
+                worldSeed, generator, height, randomState);
+            if (fixed != null) {
+                edges.put(fixed.key(), fixed);
+                liveEdges.add(fixed);
+                degree.put(fixed.fromId(), degree.getOrDefault(fixed.fromId(), 0) + 1);
+                degree.put(fixed.toId(), degree.getOrDefault(fixed.toId(), 0) + 1);
+                repaired++;
+            } else {
+                unrepairable.add(orphan);
+            }
+        }
+
+        for (UUID id : unrepairable) {
+            nodes.remove(id);
+        }
+
+        int stitched = stitchTownComponents(nodes, edges, townIds, pos, degree, liveEdges,
+            worldSeed, generator, height, randomState);
+
+        LOGGER.info("[RoadNetworkBuilder] Гарантия связности: сирот {}, починено {}, удалено {}, сшито мостов {}",
+            orphans.size(), repaired, unrepairable.size(), stitched);
+    }
+
+    /** Чинит одного сироту: ближайший сосед с проверенной дорогой (без ролла, детерминированно). */
+    private static RoadEdge repairOrphan(UUID orphan,
+                                         Set<UUID> townIds,
+                                         Map<UUID, RoadNode> nodes,
+                                         Map<UUID, double[]> pos,
+                                         Map<UUID, Integer> degree,
+                                         List<RoadEdge> liveEdges,
+                                         long worldSeed,
+                                         ChunkGenerator generator,
+                                         LevelHeightAccessor height,
+                                         RandomState randomState) {
+        RoadNode from = nodes.get(orphan);
+        if (from == null) {
+            return null;
+        }
+        List<LinkCandidate> cands = new ArrayList<>();
+        for (Map.Entry<UUID, double[]> e : pos.entrySet()) {
+            UUID other = e.getKey();
+            if (other.equals(orphan)) {
+                continue;
+            }
+            double[] po = e.getValue();
+            double[] pf = pos.get(orphan);
+            double dist = Math.hypot(pf[0] - po[0], pf[1] - po[1]);
+            if (dist >= MIN_LINK_DIST && dist <= ORPHAN_LINK_RADIUS) {
+                cands.add(new LinkCandidate(orphan, other, dist));
+            }
+        }
+        cands.sort(Comparator.comparingDouble(LinkCandidate::dist)
+            .thenComparing(c -> c.a().toString() + c.b().toString()));
+
+        int tried = 0;
+        for (LinkCandidate c : cands) {
+            if (tried++ >= 12) {
+                break;
+            }
+            UUID other = c.b();
+            if (degree.getOrDefault(other, MAX_DEGREE) >= MAX_DEGREE) {
+                continue; // Не вытесняем чужие рёбра ради сироты.
+            }
+            if (crossesLive(c.a(), c.b(), pos, liveEdges)) {
+                continue;
+            }
+            RoadNode to = nodes.get(other);
+            if (to == null || townIds.contains(other) && townIds.contains(orphan)) {
+                continue;
+            }
+            RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
+            if (edge != null) {
+                return edge;
+            }
+        }
+        return null;
+    }
+
+    /** Сшивает изолированные компоненты с городами проверенными мостами (города не должны висеть). */
+    private static int stitchTownComponents(Map<UUID, RoadNode> nodes,
+                                            Map<String, RoadEdge> edges,
+                                            Set<UUID> townIds,
+                                            Map<UUID, double[]> pos,
+                                            Map<UUID, Integer> degree,
+                                            List<RoadEdge> liveEdges,
+                                            long worldSeed,
+                                            ChunkGenerator generator,
+                                            LevelHeightAccessor height,
+                                            RandomState randomState) {
+        List<UUID> ids = new ArrayList<>(nodes.keySet());
+        UnionFind uf = new UnionFind(ids);
+        for (RoadEdge e : liveEdges) {
+            uf.union(e.fromId(), e.toId());
+        }
+        Map<Integer, List<UUID>> components = new HashMap<>();
+        for (UUID id : ids) {
+            components.computeIfAbsent(uf.find(id), k -> new ArrayList<>()).add(id);
+        }
+        if (components.size() <= 1) {
+            return 0;
+        }
+        List<UUID> townList = new ArrayList<>(townIds);
+        townList.sort(Comparator.comparing(UUID::toString));
+        int mainRoot = uf.find(townList.get(0));
+        Set<UUID> mainSet = new HashSet<>(components.getOrDefault(mainRoot, List.of()));
+
+        List<List<UUID>> townComponents = new ArrayList<>();
+        List<List<UUID>> plainComponents = new ArrayList<>();
+        for (Map.Entry<Integer, List<UUID>> e : components.entrySet()) {
+            if (e.getKey() == mainRoot) {
+                continue;
+            }
+            if (e.getValue().stream().anyMatch(townIds::contains)) {
+                townComponents.add(e.getValue());
+            } else {
+                plainComponents.add(e.getValue());
+            }
+        }
+        townComponents.sort(Comparator.comparingInt(List::size));
+        // Маленькие waypoint-компоненты без городов (одиночки/пары от ремонта)
+        // не трогаем: это и есть разрешённые BDO-ветки. Сшиваем только города.
+        int stitched = 0;
+        for (List<UUID> members : townComponents) {
+            UUID[] pair = findLiveBridge(members, mainSet, pos, liveEdges, degree, ORPHAN_TOWN_RADIUS);
+            if (pair == null) {
+                LOGGER.warn("[RoadNetworkBuilder] Компонента с городом осталась изолированной ({} узлов)", members.size());
+                continue;
+            }
+            RoadNode from = nodes.get(pair[0]);
+            RoadNode to = nodes.get(pair[1]);
+            if (from == null || to == null) {
+                continue;
+            }
+            RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
+            if (edge == null) {
+                continue;
+            }
+            edges.put(edge.key(), edge);
+            liveEdges.add(edge);
+            degree.put(edge.fromId(), degree.getOrDefault(edge.fromId(), 0) + 1);
+            degree.put(edge.toId(), degree.getOrDefault(edge.toId(), 0) + 1);
+            uf.union(edge.fromId(), edge.toId());
+            mainSet.addAll(members);
+            stitched++;
+        }
+        return stitched;
+    }
+
+    /** Перемычка между компонентой и главной сетью (без пересечений с живыми рёбрами). */
+    private static UUID[] findLiveBridge(List<UUID> members,
+                                         Set<UUID> mainSet,
+                                         Map<UUID, double[]> pos,
+                                         List<RoadEdge> liveEdges,
+                                         Map<UUID, Integer> degree,
+                                         double limit) {
+        List<LinkCandidate> cross = new ArrayList<>();
+        for (UUID m : members) {
+            for (UUID g : mainSet) {
+                double[] pm = pos.get(m);
+                double[] pg = pos.get(g);
+                if (pm == null || pg == null) {
+                    continue;
+                }
+                double dist = Math.hypot(pm[0] - pg[0], pm[1] - pg[1]);
+                if (dist >= MIN_LINK_DIST && dist <= limit) {
+                    cross.add(new LinkCandidate(m, g, dist));
+                }
+            }
+        }
+        cross.sort(Comparator.comparingDouble(LinkCandidate::dist)
+            .thenComparing(c -> c.a().toString() + c.b().toString()));
+        int tried = 0;
+        for (LinkCandidate c : cross) {
+            if (tried++ >= 12) {
+                break;
+            }
+            if (degree.getOrDefault(c.a(), MAX_DEGREE) >= MAX_DEGREE
+                || degree.getOrDefault(c.b(), MAX_DEGREE) >= MAX_DEGREE) {
+                continue;
+            }
+            if (crossesLive(c.a(), c.b(), pos, liveEdges)) {
+                continue;
+            }
+            return new UUID[]{c.a(), c.b()};
+        }
+        return null;
+    }
+
+    private static boolean crossesLive(UUID a,
+                                       UUID b,
+                                       Map<UUID, double[]> pos,
+                                       List<RoadEdge> liveEdges) {
+        double[] pa = pos.get(a);
+        double[] pb = pos.get(b);
+        if (pa == null || pb == null) {
+            return true;
+        }
+        for (RoadEdge e : liveEdges) {
+            if (e.connects(a) || e.connects(b)) {
+                continue;
+            }
+            // Координаты концов живого ребра берём из pos по id (узлы ещё не вычищены).
+            double[] pc = pos.get(e.fromId());
+            double[] pd = pos.get(e.toId());
+            if (pc == null || pd == null) {
+                continue;
+            }
+            if (segmentsIntersect(pa[0], pa[1], pb[0], pb[1], pc[0], pc[1], pd[0], pd[1])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static final class UnionFind {
