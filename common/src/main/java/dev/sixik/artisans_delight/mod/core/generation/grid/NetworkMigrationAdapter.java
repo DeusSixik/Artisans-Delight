@@ -4,12 +4,14 @@ import dev.sixik.artisans_delight.libs.world.WorldObject;
 import dev.sixik.artisans_delight.libs.world.WorldObjectManager;
 import dev.sixik.artisans_delight.mod.core.knot.data.KnotRouteEntry;
 import dev.sixik.artisans_delight.mod.core.knot.data.RoadPoint2D;
+import dev.sixik.artisans_delight.mod.core.generation.path.CoarsePathfinder;
 import dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress;
 import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import it.unimi.dsi.fastutil.objects.ObjectList;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.LevelHeightAccessor;
 import net.minecraft.world.level.chunk.ChunkGenerator;
@@ -159,12 +161,12 @@ public final class NetworkMigrationAdapter {
         long coarseTime = System.currentTimeMillis() - startCoarse;
         LOGGER.info("[NetworkMigrationAdapter] Грубый граф построен за {} мс", coarseTime);
         
-        // 3.5 Строим морские маршруты между портами
-        GenerationProgress.setStage(GenerationProgress.Stage.SEA_ROUTES);
-        long startSea = System.currentTimeMillis();
-        SeaRouteBuilder.buildSeaRoutes(manager.all(), manager, worldSeed, generator, heightAccessor, randomState);
-        long seaTime = System.currentTimeMillis() - startSea;
-        LOGGER.info("[NetworkMigrationAdapter] Морские маршруты построены за {} мс", seaTime);
+        // 3.5 Морские маршруты ВРЕМЕННО ОТКЛЮЧЕНЫ.
+        // Для полноценных морских путей нужен отдельный механизм поиска по воде
+        // (фарватер, морские узлы, обход островов). Пока портовые города
+        // остаются обычными городами и подключаются только сухопутными дорогами.
+        long seaTime = 0L;
+        LOGGER.info("[NetworkMigrationAdapter] Морские маршруты отключены (SeaRouteBuilder не вызывается)");
         
         // 4. Строим тонкий слой (геометрия дорог между соседними узлами)
         GenerationProgress.setStage(GenerationProgress.Stage.FINE_GEOMETRY);
@@ -245,23 +247,44 @@ public final class NetworkMigrationAdapter {
                 
                 BlockPos toPos = getPosition(to);
                 if (toPos == null) continue;
-                
-                double distance = Math.sqrt(fromPos.distSqr(toPos));
-                
+
+                double euclid = Math.sqrt(fromPos.distSqr(toPos));
+
                 dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.setProgress(
                     edgeCount, totalEdges,
-                    (int) distance + "м"
+                    (int) euclid + "м"
                 );
                 
                 // Определяем, морское ли это ребро (оба конца — морские узлы или порт)
                 boolean isSeaEdge = isSeaNode(from) || isSeaNode(to);
-                
-                // Прямые линии между СОСЕДНИМИ узлами (короткие сегменты).
-                // Детальная криволинейная геометрия — отдельная задача оптимизации FinePathfinder.
+
+                // Геометрия дороги через CoarsePathfinder (гибкая дорога с учётом рельефа,
+                // мостами через реки и обходом океанов). Прямая линия — только fallback,
+                // если pathfinder вернул пустой путь (например, разделённые океаном узлы).
                 List<RoadPoint2D> path = List.of(
                     new RoadPoint2D(fromPos.getX(), fromPos.getZ(), false),
                     new RoadPoint2D(toPos.getX(), toPos.getZ(), false)
                 );
+                ObjectList<RoadPoint2D> found = CoarsePathfinder.findLandRoad(
+                    generator, heightAccessor, randomState,
+                    fromPos.getX(), fromPos.getZ(), toPos.getX(), toPos.getZ()
+                );
+                double distance;
+                if (!found.isEmpty() && found.size() >= 2) {
+                    List<RoadPoint2D> copy = new ArrayList<>(found.size());
+                    for (RoadPoint2D pt : found) {
+                        copy.add(new RoadPoint2D(pt.x(), pt.z(), pt.isBridge()));
+                    }
+                    path = copy;
+                    distance = 0.0;
+                    for (int i = 0; i < path.size() - 1; i++) {
+                        distance += path.get(i).distance(path.get(i + 1));
+                    }
+                } else {
+                    distance = Math.sqrt(fromPos.distSqr(toPos));
+                    LOGGER.warn("[NetworkMigrationAdapter] Не удалось построить дорогу ({}м) между [{}, {}] и [{}, {}] — оставляю прямую линию",
+                        (int) distance, fromPos.getX(), fromPos.getZ(), toPos.getX(), toPos.getZ());
+                }
                 
                 // Сохраняем в финальную переменную для lambda
                 final List<RoadPoint2D> finalPath = path;

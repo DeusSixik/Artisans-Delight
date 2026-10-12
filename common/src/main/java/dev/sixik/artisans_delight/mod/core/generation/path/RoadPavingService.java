@@ -33,6 +33,17 @@ public final class RoadPavingService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RoadPavingService.class);
 
+    /**
+     * Главный выключатель мощения дорог в мире.
+     *
+     * <p>Сейчас сеть считается ВИРТУАЛЬНО (см. {@code roadmodel}): узлы и дороги
+     * существуют только как расчёт для карты, в мир ничего не пишется.
+     * Мощение чанков (единственное место, ставящее блоки) отключено, пока не будет
+     * готова нормальная система интеграции (NetworkApplier).
+     * Чтобы вернуть мощение: {@code PAVING_ENABLED = true}.
+     */
+    public static final boolean PAVING_ENABLED = false;
+
     public enum PavingTier {
         TRAIL,    // Грунтовая тропа: расчистка травы, грязь / dirt_path
         ROAD,     // Наезженный тракт: гравий, плотная грязь, настилы
@@ -54,6 +65,7 @@ public final class RoadPavingService {
     public static void paveUnderEntity(
             Level level, BlockPos entityPos, double radius, PavingTier targetTier, float upgradeChance) {
 
+        if (!PAVING_ENABLED) return;
         if (level == null || entityPos == null || level.isClientSide()) return;
 
         int minX = (int) Math.floor(entityPos.getX() - radius);
@@ -193,6 +205,7 @@ public final class RoadPavingService {
      * Автоматическая первичная прокладка дорог при генерации чанка мира (Chunk Decoration).
      */
     public static void paveChunk(WorldGenLevel level, ChunkAccess chunk) {
+        if (!PAVING_ENABLED) return;
         if (level == null || chunk == null) return;
 
         WorldObjectManager manager;

@@ -98,7 +98,7 @@ public final class JunctionEngine {
      * Режим отладки: включает детальные логи в консоль.
      * Установите true для диагностики проблем с дорогами и развилками.
      */
-    public static boolean DEBUG_MODE = true;
+    public static boolean DEBUG_MODE = false;
 
     private static final ResourceLocation JUNCTION_ICON =
             ResourceLocation.tryBuild("minecraft", "air");

@@ -134,20 +134,28 @@ public final class CoarseGraphBuilder {
         int totalNodes = 0;
         for (int i = 0; i < mstEdges.size(); i++) {
             TownEdge edge = mstEdges.get(i);
-            LOGGER.info("[CoarseGraphBuilder] Обрабатываю ребро {}/{}: {} -> {} (расстояние: {} блоков)", 
+            BlockPos posA = getPosition(edge.townA);
+            BlockPos posB = getPosition(edge.townB);
+            
+            String nameA = edge.townA.getSingle(dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent.class)
+                .map(m -> m.name.get()).orElse("UNKNOWN");
+            String nameB = edge.townB.getSingle(dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent.class)
+                .map(m -> m.name.get()).orElse("UNKNOWN");
+            
+            LOGGER.info("[CoarseGraphBuilder] Обрабатываю ребро {}/{}: '{}' [{}, {}] -> '{}' [{}, {}] (расстояние: {} блоков)", 
                 i + 1, mstEdges.size(), 
-                edge.townA.id().toString().substring(0, 8), 
-                edge.townB.id().toString().substring(0, 8),
+                nameA, posA.getX(), posA.getZ(),
+                nameB, posB.getX(), posB.getZ(),
                 (int) edge.distance);
             
             dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.setProgress(
                 i + 1, mstEdges.size(),
-                edge.townA.id().toString().substring(0, 8) + " -> " + edge.townB.id().toString().substring(0, 8)
+                nameA + " -> " + nameB
             );
             
-            int nodes = createNodeChain(edge.townA, edge.townB, manager, worldSeed, generator, heightAccessor, randomState);
+            int nodes = createNodeChain(edge.townA, edge.townB, manager, worldSeed, generator, heightAccessor, randomState, totalNodes);
             totalNodes += nodes;
-            LOGGER.info("[CoarseGraphBuilder] Создано {} промежуточных узлов", nodes);
+            LOGGER.info("[CoarseGraphBuilder] Создано {} промежуточных узлов для '{}' -> '{}'", nodes, nameA, nameB);
         }
         
         LOGGER.info("[CoarseGraphBuilder] Построение грубого графа завершено. Всего создано {} промежуточных узлов", totalNodes);
@@ -173,6 +181,7 @@ public final class CoarseGraphBuilder {
      * @param generator Генератор мира
      * @param heightAccessor Информация о границах высоты
      * @param randomState Состояние генератора шума
+     * @param startIndex Порядковый номер для нумерации имён узлов (сквозной по сети)
      */
     private static int createNodeChain(WorldObject townA,
                                        WorldObject townB,
@@ -180,7 +189,8 @@ public final class CoarseGraphBuilder {
                                        long worldSeed,
                                        ChunkGenerator generator,
                                        LevelHeightAccessor heightAccessor,
-                                       RandomState randomState) {
+                                       RandomState randomState,
+                                       int startIndex) {
         
         BlockPos posA = getPosition(townA);
         BlockPos posB = getPosition(townB);
@@ -201,7 +211,13 @@ public final class CoarseGraphBuilder {
         
         if (roadPath.isEmpty()) {
             // Города разделены океаном — пропускаем (порты обработает SeaRouteBuilder)
-            LOGGER.info("[CoarseGraphBuilder] Не удалось построить сухопутную дорогу между городами (возможно, океан). Пропускаю.");
+            String nameA = townA.getSingle(dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent.class)
+                .map(m -> m.name.get()).orElse("UNKNOWN");
+            String nameB = townB.getSingle(dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent.class)
+                .map(m -> m.name.get()).orElse("UNKNOWN");
+            LOGGER.warn("[CoarseGraphBuilder] Не удалось построить сухопутную дорогу между '{}' [{}, {}] и '{}' [{}, {}] (возможно, океан или слишком большое расстояние). Пропускаю.",
+                nameA, posA.getX(), posA.getZ(),
+                nameB, posB.getX(), posB.getZ());
             return 0;
         }
         
@@ -289,8 +305,8 @@ public final class CoarseGraphBuilder {
                 waypointPos = new BlockPos(x, posA.getY(), z);
             }
             
-            // Создаём узел
-            WorldObject node = createWaypointNode(waypointPos, manager);
+            // Создаём узел (нумеруем последовательно по всей сети через счётчик)
+            WorldObject node = createWaypointNode(waypointPos, manager, startIndex + i);
             chain.add(node);
         }
         
@@ -317,17 +333,23 @@ public final class CoarseGraphBuilder {
     /**
      * Создаёт узел-вейпоинт в заданной позиции.
      * 
+     * <p>Узлу присваивается человекочитаемое имя «Перекрёсток #N», где N —
+     * порядковый номер создаваемого промежуточного узла (для удобства на карте).
+     * 
      * @param position Координаты узла
      * @param manager Менеджер узлов
+     * @param index Порядковый номер узла (для имени)
      * @return Созданный узел
      */
-    private static WorldObject createWaypointNode(BlockPos position, WorldObjectManager manager) {
+    private static WorldObject createWaypointNode(BlockPos position, WorldObjectManager manager, int index) {
         WorldObject node = manager.create();
         
-        node.attach(new KnotMetaComponent(
+        KnotMetaComponent meta = new KnotMetaComponent(
             KnotType.WAYPOINT,
             position
-        ));
+        );
+        meta.name.set("Перекрёсток #" + index);
+        node.attach(meta);
         
         node.attach(new KnotRoutesComponent());
         node.attach(new KnotConnectionComponent());

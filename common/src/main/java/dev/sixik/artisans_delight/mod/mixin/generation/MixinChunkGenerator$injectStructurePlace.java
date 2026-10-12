@@ -113,7 +113,15 @@ public class MixinChunkGenerator$injectStructurePlace {
                 manager, data.getGenLevel().getLevel(), chunkGenerator, randomState, origin, 3000
         );
 
-        // 3. Автоматически подключаем поселение к сети узлов мира без создания лишних прямых срезок
-        KnotNetworkGraph.connectNewKnot(townKnot, manager, chunkGenerator, data.getGenLevel(), randomState);
+        // 3. Подключаем поселение к сети узлов мира.
+        // Если сеть уже построена — запрашиваем ОТЛОЖЕННУЮ пересборку (debounce),
+        // чтобы новый город вошёл в граф через промежуточные узлы, а не напрямую.
+        // Если сеть ещё строится — первичная генерация подхватит этот город сама.
+        if (data.getGenLevel() instanceof net.minecraft.server.level.ServerLevel serverLevel) {
+            dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer.requestNetworkRebuild(serverLevel);
+        } else {
+            // Фолбэк для не-серверных уровней (не должно случаться в норме)
+            KnotNetworkGraph.connectNewKnot(townKnot, manager, chunkGenerator, data.getGenLevel(), randomState);
+        }
     }
 }
