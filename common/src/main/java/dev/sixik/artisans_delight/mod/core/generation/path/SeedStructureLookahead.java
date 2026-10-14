@@ -8,7 +8,10 @@ import dev.sixik.artisans_delight.mod.core.knot.KnotType;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotConnectionComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotMetaComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.KnotRoutesComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.town.TownLodgingComponent;
 import dev.sixik.artisans_delight.mod.core.knot.components.town.TownPortComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.town.TownWarehouseComponent;
+import dev.sixik.artisans_delight.mod.core.knot.components.town.TownWorkshopsComponent;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.QuartPos;
@@ -42,6 +45,21 @@ import java.util.*;
 public final class SeedStructureLookahead {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SeedStructureLookahead.class);
+
+    /**
+     * Общий мьютекс всех городовых мутаций менеджера: предикт и миксин
+     * физической генерации меняют города только под ним. Без него конкурентный
+     * предикт и генерация чанка дают два объекта одного села: предсказанный
+     * центр чанка vs реальный origin структуры (~11 блоков — два пина рядом).
+     */
+    public static final Object TOWN_MUTEX = new Object();
+
+    /**
+     * Радиус слияния дублей городов. Заведомо меньше {@code 128} из проверок
+     * близости (чтобы не трогать реально соседние сёла), но с запасом покрывает
+     * расхождение предсказания и физической генерации (~11 блоков).
+     */
+    private static final double TOWN_DEDUP_RADIUS = 96.0;
 
     private SeedStructureLookahead() {
     }
@@ -85,6 +103,9 @@ public final class SeedStructureLookahead {
         List<WorldObject> predictedKnots = new ArrayList<>();
         Set<Long> processedChunks = new HashSet<>();
 
+        // Все мутации менеджера — под TOWN_MUTEX (см. поле): проверка+вставка
+        // атомарны относительно миксина физической генерации.
+        synchronized (TOWN_MUTEX) {
         for (Holder<StructureSet> setHolder : possibleSets) {
             StructureSet set = setHolder.value();
             if (set == null) continue;
@@ -175,12 +196,134 @@ public final class SeedStructureLookahead {
             }
         }
 
+        // Ремонт гонок прошлого: сносим дубли ближе TOWN_DEDUP_RADIUS.
+        // Вызывается под мьютексом из всех путей (init, миксин, открытие карты).
+        int mergedDupes = dedupeTownKnots(manager);
+        if (mergedDupes > 0) {
+            LOGGER.info("Seed Lookahead: смержено дублей городов: {}", mergedDupes);
+        }
+        } // end synchronized (TOWN_MUTEX)
+
         if (!predictedKnots.isEmpty()) {
             LOGGER.info("Seed Lookahead: предсказано {} поселений в радиусе {} блоков вокруг ({}, {})",
                     predictedKnots.size(), radiusBlocks, centerBlockX, centerBlockZ);
         }
 
         return predictedKnots;
+    }
+
+    /**
+     * Сносит дубли городов ближе {@link #TOWN_DEDUP_RADIUS} друг к другу.
+     *
+     * <p>Выживает более «богатый» объект (реальный, со складом/домами/портом —
+     * у чистого предсказания только мета+связи+маршруты). При ничьей — первый
+     * по id (детерминированно). Железо (порт, склад, барак, мастерские)
+     * переносится с удаляемого на выжившего, если того не хватало.
+     *
+     * <p>Вызывать только под {@link #TOWN_MUTEX}.
+     *
+     * @return число удалённых дублей
+     */
+    public static int dedupeTownKnots(WorldObjectManager manager) {
+        if (manager == null) return 0;
+        List<WorldObject> towns = new ArrayList<>();
+        for (WorldObject obj : manager.snapshot()) {
+            KnotMetaComponent meta = obj.getSingle(KnotMetaComponent.class).orElse(null);
+            if (meta == null || meta.type.get() != KnotType.TOWN) continue;
+            if (meta.position.get() == null) continue;
+            towns.add(obj);
+        }
+        if (towns.size() < 2) return 0;
+        towns.sort(Comparator.comparing(o -> o.id().toString()));
+
+        double r2 = TOWN_DEDUP_RADIUS * TOWN_DEDUP_RADIUS;
+        Set<UUID> dead = new HashSet<>();
+        int removed = 0;
+        for (int i = 0; i < towns.size(); i++) {
+            WorldObject surv = towns.get(i);
+            if (dead.contains(surv.id())) continue;
+            BlockPos survPos = townPos(surv);
+            if (survPos == null) continue;
+            for (int j = i + 1; j < towns.size(); j++) {
+                WorldObject other = towns.get(j);
+                if (dead.contains(other.id())) continue;
+                BlockPos otherPos = townPos(other);
+                if (otherPos == null) continue;
+                double dx = (double) survPos.getX() - otherPos.getX();
+                double dz = (double) survPos.getZ() - otherPos.getZ();
+                if (dx * dx + dz * dz > r2) continue;
+                WorldObject keep = townRichness(other) > townRichness(surv) ? other : surv;
+                WorldObject drop = (keep == surv) ? other : surv;
+                transferTownHardware(drop, keep);
+                if (manager.remove(drop.id())) {
+                    dead.add(drop.id());
+                    removed++;
+                    LOGGER.info("Seed Lookahead: дубль {} merged into {} ({} м)",
+                        townLabel(drop), townLabel(keep),
+                        (int) Math.sqrt(dx * dx + dz * dz));
+                }
+                if (drop == surv) {
+                    surv = keep;
+                    survPos = townPos(surv);
+                    if (survPos == null) break;
+                }
+            }
+        }
+        return removed;
+    }
+
+    private static BlockPos townPos(WorldObject town) {
+        KnotMetaComponent meta = town.getSingle(KnotMetaComponent.class).orElse(null);
+        return meta == null ? null : meta.position.get();
+    }
+
+    private static String townLabel(WorldObject town) {
+        KnotMetaComponent meta = town.getSingle(KnotMetaComponent.class).orElse(null);
+        if (meta == null) return town.id().toString().substring(0, 8);
+        BlockPos pos = meta.position.get();
+        String name = "<?>";
+        try {
+            name = String.valueOf(meta.name.get());
+        } catch (Throwable ignored) {
+        }
+        return pos == null ? name : name + " [" + pos.getX() + "," + pos.getZ() + "]";
+    }
+
+    /** Число игровых компонентов: реальный город богаче чистого предсказания. */
+    private static int townRichness(WorldObject town) {
+        int score = 0;
+        if (town.getSingle(KnotConnectionComponent.class).isPresent()) score++;
+        if (town.getSingle(KnotRoutesComponent.class).isPresent()) score++;
+        if (town.getSingle(TownWarehouseComponent.class).isPresent()) score++;
+        if (town.getSingle(TownLodgingComponent.class).isPresent()) score++;
+        if (town.getSingle(TownWorkshopsComponent.class).isPresent()) score++;
+        if (town.getSingle(TownPortComponent.class).isPresent()) score++;
+        return score;
+    }
+
+    /** Переносит недостающее железо с удаляемого дубля на выжившего. */
+    private static void transferTownHardware(WorldObject drop, WorldObject keep) {
+        try {
+            if (keep.getSingle(TownWarehouseComponent.class).isEmpty()
+                && drop.getSingle(TownWarehouseComponent.class).isPresent()) {
+                keep.attach(new TownWarehouseComponent());
+            }
+            if (keep.getSingle(TownLodgingComponent.class).isEmpty()
+                && drop.getSingle(TownLodgingComponent.class).isPresent()) {
+                keep.attach(new TownLodgingComponent());
+            }
+            if (keep.getSingle(TownWorkshopsComponent.class).isEmpty()
+                && drop.getSingle(TownWorkshopsComponent.class).isPresent()) {
+                keep.attach(new TownWorkshopsComponent());
+            }
+            Optional<TownPortComponent> dropPort = drop.getSingle(TownPortComponent.class);
+            if (keep.getSingle(TownPortComponent.class).isEmpty() && dropPort.isPresent()) {
+                BlockPos pier = dropPort.get().pierPos.get();
+                keep.attach(new TownPortComponent(pier == null ? BlockPos.ZERO : pier));
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("Seed Lookahead: не перенеслось железо дубля: {}", t.toString());
+        }
     }
 
     public static boolean hasNearbyKnot(WorldObjectManager manager, int blockX, int blockZ, double maxDist) {

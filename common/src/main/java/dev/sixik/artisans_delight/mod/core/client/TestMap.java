@@ -86,8 +86,12 @@ import dev.sixik.artisans_delight.mod.core.knot.data.RoadPoint2D;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TestMap {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(TestMap.class);
 
     // === РЕЖИМ ОТОБРАЖЕНИЯ ДОРОГ И ПУТЕЙ (ЛОГИЧЕСКАЯ СЕТЬ vs РЕАЛЬНЫЕ ПУТИ) ===
     // По умолчанию показываем реальные дороги: после генерации V2 каждый сегмент
@@ -153,6 +157,9 @@ public class TestMap {
     private static WorldObjectManager activeMapManager;
     // Маркер-якоря, уже созданные для узлов (id "knot_" + UUID), чтобы не дублировать
     private static final Set<UUID> activeKnotMarkerIds = new HashSet<>();
+    // id маркера -> id игрового объекта города, к которому маркер привязан
+    // (после слияния дублей за тем же id может стоять другой объект)
+    private static final Map<UUID, UUID> activeMarkerSource = new HashMap<>();
     // Ревизия виртуальной сети, для которой построены маркеры (см. RoadNetworkStore)
     private static long lastMarkerNetworkRevision = -1L;
     // Сид мира открытой карты (для детерминированных id городов до публикации сети)
@@ -401,6 +408,7 @@ public class TestMap {
                 activeNetworkStatusBox = null;
                 activeProgressTooltip = null;
                 activeKnotMarkerIds.clear();
+                activeMarkerSource.clear();
                 lastMarkerNetworkRevision = -1L;
                 activeWorldSeed = 0L;
                 Minecraft.getInstance().setScreen(previous);
@@ -414,8 +422,9 @@ public class TestMap {
             @Override
             public void tick() {
                 super.tick();
-                // Авто-скрытие индикатора генерации, когда сеть готова
-                if (activeNetworkStatusBox != null && activeNetworkStatusBox.visible()) {
+                // Индикатор генерации: виден, пока сеть не готова ИЛИ идёт
+                // пересборка (Ctrl+R/T/G), иначе скрыт.
+                if (activeNetworkStatusBox != null) {
                     boolean ready;
                     if (minecraft.getSingleplayerServer() != null && minecraft.level != null) {
                         ServerLevel sl = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
@@ -423,8 +432,10 @@ public class TestMap {
                     } else {
                         ready = true;
                     }
-                    if (ready) {
-                        activeNetworkStatusBox.visible(false);
+                    boolean want = !ready
+                            || dev.sixik.artisans_delight.mod.core.generation.path.GenerationProgress.isRunning();
+                    if (activeNetworkStatusBox.visible() != want) {
+                        activeNetworkStatusBox.visible(want);
                     }
                 }
                 // Живое обновление подсказки прогресса, пока она показана
@@ -468,25 +479,36 @@ public class TestMap {
                     }
                 }
 
-                // 1. Города из менеджера — всегда (даже до готовности сети)
+                // 1. Города из менеджера — всегда (даже до готовности сети).
+                // Каждый город изолирован try/catch: один битый объект не должен
+                // ронять весь цикл — иначе города после него останутся без маркеров.
+                // Порядок детерминирован (сортировка по id), чтобы при повторе
+                // ошибки страдал стабильный поднабор, а не случайный.
                 if (!townObjects.isEmpty()) {
                     long seed = currentWorldSeed();
-                    for (WorldObject townObj : townObjects.values()) {
-                        Optional<KnotMetaComponent> mOpt = townObj.getSingle(KnotMetaComponent.class);
-                        if (mOpt.isEmpty()) continue;
-                        BlockPos pos = mOpt.get().position.get();
-                        if (pos == null) continue;
-                        UUID virtualId = (seed != 0L)
-                                ? dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.townId(
-                                        seed, pos.getX(), pos.getZ())
-                                : townObj.id();
-                        if (activeKnotMarkerIds.contains(virtualId)) continue;
-                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode cityNode =
-                                new dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode(
-                                        virtualId,
-                                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode.Kind.TOWN,
-                                        mOpt.get().name.get(), pos.getX(), pos.getY(), pos.getZ(), townObj.id());
-                        addKnotMarker(activeCanvas, activeRootOverlay, cityNode, townObj);
+                    List<WorldObject> orderedTowns = new ArrayList<>(townObjects.values());
+                    orderedTowns.sort(Comparator.comparing(o -> o.id().toString()));
+                    for (WorldObject townObj : orderedTowns) {
+                        try {
+                            Optional<KnotMetaComponent> mOpt = townObj.getSingle(KnotMetaComponent.class);
+                            if (mOpt.isEmpty()) continue;
+                            BlockPos pos = mOpt.get().position.get();
+                            if (pos == null) continue;
+                            UUID virtualId = (seed != 0L)
+                                    ? dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.townId(
+                                            seed, pos.getX(), pos.getZ())
+                                    : townObj.id();
+                            if (activeKnotMarkerIds.contains(virtualId)) continue;
+                            dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode cityNode =
+                                    new dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode(
+                                            virtualId,
+                                            dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode.Kind.TOWN,
+                                            mOpt.get().name.get(), pos.getX(), pos.getY(), pos.getZ(), townObj.id());
+                            addKnotMarker(activeCanvas, activeRootOverlay, cityNode, townObj);
+                        } catch (Throwable t) {
+                            LOGGER.warn("[TestMap] Пропуск маркера города {}: {}",
+                                townObj.id(), t.toString());
+                        }
                     }
                 }
 
@@ -497,24 +519,29 @@ public class TestMap {
 
                 long rev = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.revision();
                 if (rev != lastMarkerNetworkRevision) {
-                    // Новая сеть: сносим только якоря перекрёстков (городские остаются)
-                    for (UUID id : new java.util.HashSet<>(activeKnotMarkerIds)) {
-                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode n = net.node(id);
-                        // узел уже не в сети ИЛИ это перекрёсток — удалить;
-                        // города из сети пропускаем (их маркеры созданы в шаге 1 с тем же id)
-                        if (n == null || !n.isTown()) {
-                            activeCanvas.anchorLayer().remove("knot_" + id);
-                            activeKnotMarkerIds.remove(id);
-                        }
-                    }
+                    // Новая ревизия больше НЕ пересоздаёт все маркеры: стример
+                    // публикует сеть каждую секунду, а id узлов стабильны (ячейка
+                    // поля / позиция города). Пропавшие узлы снимает
+                    // reconcileStaleMarkers ниже, новые добавляет цикл ниже.
                     lastMarkerNetworkRevision = rev;
                 }
 
                 for (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNode node : net.nodes()) {
                     if (node.isTown()) continue; // города уже созданы в шаге 1
                     if (activeKnotMarkerIds.contains(node.id())) continue;
-                    addKnotMarker(activeCanvas, activeRootOverlay, node, null);
+                    try {
+                        addKnotMarker(activeCanvas, activeRootOverlay, node, null);
+                    } catch (Throwable t) {
+                        LOGGER.warn("[TestMap] Пропуск маркера перекрёстка {}: {}",
+                            node.id(), t.toString());
+                    }
                 }
+
+                // 3. Самолечение протухших маркеров каждый тик (а не только при
+                // смене ревизии): якорь города, чей объект удалён из менеджера
+                // (например, смерженный дубль), или перекрёстка, вырезанного из
+                // сети, сносится сразу. Живые города вне сети не трогаем.
+                reconcileStaleMarkers(net, townObjects, currentWorldSeed());
             }
 
             @Override
@@ -529,44 +556,38 @@ public class TestMap {
                     return true;
                 }
 
-                // 2. Ctrl + R: принудительный пересчет ВИРТУАЛЬНОЙ сети (ТОЛЬКО ДЛЯ ДЕБАГА!)
-                // ВНИМАНИЕ: Синхронный пересчёт, будет зависать UI на 30-60 секунд!
-                // В мир ничего не пишется — только расчёт + публикация в RoadNetworkStore.
-                if (keyCode == GLFW.GLFW_KEY_R && Screen.hasControlDown()) {
-                    if (currentKnotsCache != null && minecraft.getSingleplayerServer() != null && minecraft.level != null) {
-                        try {
-                            ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
-                            if (sLevel != null) {
-                                if (activeStatus != null) {
-                                    activeStatus.text("[DEBUG] Пересчитываю сеть... (может зависнуть на 30-60 сек)");
-                                }
-
-                                ChunkGenerator gen = sLevel.getChunkSource().getGenerator();
-                                RandomState state = sLevel.getChunkSource().randomState();
-                                BlockPos center = minecraft.player != null ? minecraft.player.blockPosition() : BlockPos.ZERO;
-                                WorldObjectManager mgr = WorldObjectManagerApi.getManager(sLevel);
-                                if (mgr != null) {
-                                    SeedStructureLookahead.predictKnotsInRange(mgr, sLevel, gen, state, center, 3500);
-                                    currentKnotsCache = new ArrayList<>(mgr.all());
-                                }
-                                long worldSeed = sLevel.getChunkSource().getGeneratorState().getLevelSeed();
-
-                                // Синхронный виртуальный пересчёт (для дебага)
-                                java.util.List<dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.TownSeed> seeds =
-                                        dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer.collectTownSeeds(mgr, worldSeed);
-                                dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork net =
-                                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.build(
-                                                seeds, worldSeed, gen, sLevel, state);
-                                dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.publish(net);
-
-                                if (mgr != null) {
-                                    mgr.markNetworkInitialized();
-                                }
-                                if (activeStatus != null) {
-                                    activeStatus.text("[DEBUG] ✓ Сеть пересчитана: " + net.nodeCount() + " узлов, " + net.edgeCount() + " рёбер");
-                                }
-                            }
-                        } catch (Throwable ignored) {
+                // 2. Дебаг виртуальной сети (в мир ничего не пишется, расчёт в фоне):
+                //    Ctrl+R — пересчитать;
+                //    Ctrl+T — переключить топологию RNG ↔ GREEDY и пересчитать;
+                //    Ctrl+G — переключить превью (прямые хорды) ↔ полная геометрия A*.
+                if (Screen.hasControlDown() && (keyCode == GLFW.GLFW_KEY_R
+                        || keyCode == GLFW.GLFW_KEY_T || keyCode == GLFW.GLFW_KEY_G)) {
+                    if (keyCode == GLFW.GLFW_KEY_T) {
+                        var cur = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.topologyMode();
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.topologyMode(
+                                cur == dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.TopologyMode.RNG
+                                        ? dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.TopologyMode.GREEDY
+                                        : dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.TopologyMode.RNG);
+                    } else if (keyCode == GLFW.GLFW_KEY_G) {
+                        var gm = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.geometryMode();
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.geometryMode(
+                                gm == dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.GeometryMode.STREAM
+                                        ? dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.GeometryMode.FULL
+                                        : dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.GeometryMode.STREAM);
+                    }
+                    String modeText = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.topologyMode()
+                            + (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.geometryMode()
+                                    == dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.GeometryMode.STREAM
+                                    ? ", дороги по мере приближения" : ", вся карта сразу (долго)");
+                    if (minecraft.getSingleplayerServer() != null && minecraft.level != null) {
+                        ServerLevel sLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                        BlockPos center = minecraft.player != null ? minecraft.player.blockPosition() : BlockPos.ZERO;
+                        boolean started = dev.sixik.artisans_delight.mod.core.generation.path.ServerNetworkInitializer
+                                .forceRebuildAsync(sLevel, center);
+                        if (activeStatus != null) {
+                            activeStatus.text(started
+                                    ? "[DEBUG] Пересчёт сети: " + modeText
+                                    : "[DEBUG] Пересчёт уже идёт (режим для следующего: " + modeText + ")");
                         }
                     }
                     return true;
@@ -658,6 +679,11 @@ public class TestMap {
 
         // Запоминаем живой менеджер: world-слой и tick() читают manager.all() каждый кадр.
         activeMapManager = manager;
+
+        // Сид — СРАЗУ, до первого тика синхронизации. Иначе первые маркеры
+        // создадутся с id игровых объектов, а следующие — с виртуальными id
+        // тех же городов (дубли пинов + протухшие якоря).
+        currentWorldSeed();
 
         // Фоновый и графический слой карты (рельеф мира, сетка, чанки, границы чанков, псевдо-связи, дороги, узлы, игрок)
         canvas.addWorldLayer((world, draw) -> {
@@ -862,7 +888,16 @@ public class TestMap {
                             && Boolean.TRUE.equals(investedVirtual.get(edge.toId()));
                     List<RoadPoint2D> pts = edge.geometry();
 
-                    if (showRoadPaths && pts.size() >= 2) {
+                    if (showRoadPaths && pts.size() >= 2 && edge.pending()) {
+                        // Ожидающее ребро: дорога ещё не разведана (досчитается,
+                        // когда игрок подойдёт). Тонкий бледный пунктир-план.
+                        RoadPoint2D p1 = pts.get(0);
+                        RoadPoint2D p2 = pts.get(pts.size() - 1);
+                        drawDashedLine(draw,
+                                world.worldToRootX((float) p1.x()), world.worldToRootY((float) p1.z()),
+                                world.worldToRootX((float) p2.x()), world.worldToRootY((float) p2.z()),
+                                new MutableColor(0.75f, 0.75f, 0.70f, 0.35f), 1.2f, 6.0f, 6.0f);
+                    } else if (showRoadPaths && pts.size() >= 2) {
                         if (edge.seaRoute()) {
                             // Морской фарватер: пунктирная лазурная линия
                             MutableColor seaColor = active
@@ -1629,7 +1664,10 @@ public class TestMap {
                                          WorldObject townObj) {
         if (canvas == null || rootOverlay == null || node == null) return false;
         UUID knotId = node.id();
-        if (!activeKnotMarkerIds.add(knotId)) return false; // уже создан
+        // Только проверка: id фиксируется в наборе ПОСЛЕ успешного создания
+        // якорей (см. конец метода). Иначе упавший маркер останется в наборе
+        // и город навсегда будет без пина (точка есть, маркера нет).
+        if (activeKnotMarkerIds.contains(knotId)) return false; // уже создан
 
         float worldX = (float) node.x();
         float worldY = (float) node.z();
@@ -1676,6 +1714,9 @@ public class TestMap {
         tooltip.maxWidth(260.0f);
 
         marker.on(PointerEnteredEvent.TYPE, event -> {
+            // Пересобираем текст на наведении: связи узла меняются по мере
+            // досчёта дорог, а маркер живёт дольше одной ревизии сети.
+            tooltip.richText(buildVirtualNodeTooltip(node, townObj));
             tooltip.invalidate(InvalidationFlags.LAYOUT | InvalidationFlags.VISUAL);
         });
 
@@ -1727,6 +1768,9 @@ public class TestMap {
                 HOUSE_TOOLTIPS.put(house.id, houseTooltip);
                 rootOverlay.addOverlay(houseTooltip);
 
+                // remove-then-add: ретрай после частичного падения не должен
+                // умирать на Duplicate anchor id — якорь просто перезапишется.
+                canvas.anchorLayer().remove("house_" + house.id);
                 AnchorWidget houseAnchor = canvas.anchorLayer().add(
                         "house_" + house.id,
                         worldX + house.relX,
@@ -1755,6 +1799,8 @@ public class TestMap {
 
         float pinW = 32.0f;
         float pinH = 36.0f;
+        // remove-then-add по той же причине, что у домиков выше.
+        canvas.anchorLayer().remove("knot_" + knotId);
         canvas.anchorLayer().add("knot_" + knotId, worldX, worldY, marker)
                 .screenSize(pinW, pinH)
                 .pivot(0.5f, 1.0f)
@@ -1766,7 +1812,65 @@ public class TestMap {
                 .zoomScaling(true, KNOT_MARKER_REF_ZOOM);
 
         rootOverlay.addOverlay(tooltip);
+        // Успех — только теперь фиксируем id. Упавший маркер в набор не
+        // попадает и будет перепробован на следующем тике.
+        activeKnotMarkerIds.add(knotId);
+        if (townObj != null) {
+            activeMarkerSource.put(knotId, townObj.id());
+        } else {
+            activeMarkerSource.remove(knotId);
+        }
         return true;
+    }
+
+    /**
+     * Сносит якоря, которым больше нет соответствия: ни узла в сети, ни живого
+     * города в менеджере. Чинит последствия удаления дублей городов и вырезания
+     * сирот без ожидания смены ревизии сети.
+     */
+    private static void reconcileStaleMarkers(
+            dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork net,
+            Map<UUID, WorldObject> townObjects,
+            long seed) {
+        if (activeCanvas == null || activeKnotMarkerIds.isEmpty()) return;
+        // виртуальный id живого города -> id его игрового объекта
+        Map<UUID, UUID> liveTownVirtual = new HashMap<>();
+        if (seed != 0L) {
+            for (WorldObject townObj : townObjects.values()) {
+                try {
+                    Optional<KnotMetaComponent> m = townObj.getSingle(KnotMetaComponent.class);
+                    if (m.isEmpty()) continue;
+                    BlockPos pos = m.get().position.get();
+                    if (pos == null) continue;
+                    liveTownVirtual.put(
+                        dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder.townId(
+                            seed, pos.getX(), pos.getZ()), townObj.id());
+                } catch (Throwable ignored) {
+                }
+            }
+        } else {
+            for (UUID id : townObjects.keySet()) {
+                liveTownVirtual.put(id, id);
+            }
+        }
+        for (UUID id : new java.util.HashSet<>(activeKnotMarkerIds)) {
+            try {
+                boolean alive = liveTownVirtual.containsKey(id)
+                    || (net != null && net.node(id) != null);
+                // Маркер города привязан к объекту, которого уже нет (смержен
+                // в другой с тем же чанком) — пересоздать с живым объектом.
+                UUID src = activeMarkerSource.get(id);
+                UUID liveSrc = liveTownVirtual.get(id);
+                boolean staleSource = src != null && liveSrc != null && !src.equals(liveSrc);
+                if (!alive || staleSource) {
+                    activeCanvas.anchorLayer().remove("knot_" + id);
+                    activeKnotMarkerIds.remove(id);
+                    activeMarkerSource.remove(id);
+                }
+            } catch (Throwable t) {
+                LOGGER.warn("[TestMap] reconcile маркера {}: {}", id, t.toString());
+            }
+        }
     }
 
     /**
@@ -1792,7 +1896,14 @@ public class TestMap {
 
         dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork net =
                 dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.current();
-        int neighborsCount = (net != null) ? net.edgesOf(node.id()).size() : 0;
+        int neighborsCount = 0;
+        int pendingCount = 0;
+        if (net != null) {
+            for (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadEdge e : net.edgesOf(node.id())) {
+                neighborsCount++;
+                if (e.pending()) pendingCount++;
+            }
+        }
 
         RichText.Builder builder = RichText.builder();
         builder.color(new MutableColor(1.0f, 0.85f, 0.20f, 1.0f))
@@ -1829,7 +1940,9 @@ public class TestMap {
 
         if (neighborsCount > 0) {
             builder.color(new MutableColor(0.70f, 0.70f, 0.70f, 1.0f))
-                   .append("Connections: " + neighborsCount + "\n");
+                   .append("Connections: " + neighborsCount
+                           + (pendingCount > 0 ? " (roads: " + (neighborsCount - pendingCount)
+                                   + ", unexplored: " + pendingCount + ")" : "") + "\n");
         }
 
         if (isTown) {

@@ -77,6 +77,22 @@ public final class ServerNetworkInitializer {
     
     private ServerNetworkInitializer() {
     }
+
+    /**
+     * Публикует сеть и, в потоковом режиме, запускает досчёт дорог у игроков.
+     * Перед расчётом новой сети вызывать {@link RoadStreamer#stopActive()},
+     * чтобы старый стример не перезаписал свежую публикацию.
+     */
+    private static void publishAndStream(ServerLevel level, RoadNetwork network) {
+        if (RoadNetworkBuilder.geometryMode() == RoadNetworkBuilder.GeometryMode.STREAM) {
+            // Стример сам публикует каркас, уже наложив дороги из кэша сессии:
+            // при пересборке посчитанные дороги не пропадают ни на кадр.
+            RoadStreamer.start(level, network);
+        } else {
+            RoadStreamer.stopActive();
+            RoadNetworkStore.publish(network);
+        }
+    }
     
     /**
      * Запускает асинхронную инициализацию сети для ServerLevel.
@@ -142,10 +158,11 @@ public final class ServerNetworkInitializer {
                     LOGGER.info("[ServerNetworkInitializer] Запускаю виртуальный расчёт дорожной сети ({} городов)...", townSeeds.size());
                     long netStartTime = System.currentTimeMillis();
 
+                    RoadStreamer.stopActive();
                     RoadNetwork network = RoadNetworkBuilder.build(
                         townSeeds, worldSeed, generator, level, randomState
                     );
-                    RoadNetworkStore.publish(network);
+                    publishAndStream(level, network);
 
                     long netTime = System.currentTimeMillis() - netStartTime;
                     long totalTime = System.currentTimeMillis() - startTime;
@@ -232,10 +249,11 @@ public final class ServerNetworkInitializer {
 
                     // Пересобираем TownSeed с реальным сидом (id должны быть детерминированы)
                     townSeeds = collectTownSeeds(manager, worldSeed);
+                    RoadStreamer.stopActive();
                     RoadNetwork network = RoadNetworkBuilder.build(
                         townSeeds, worldSeed, generator, level, randomState
                     );
-                    RoadNetworkStore.publish(network);
+                    publishAndStream(level, network);
 
                     LAST_REBUILD_TOWN_COUNT.put(dimensionKey, townCount);
                     GenerationProgress.finish();
@@ -249,6 +267,56 @@ public final class ServerNetworkInitializer {
         });
     }
     
+    /** Идёт ли сейчас принудительная пересборка (защита от очереди из нажатий). */
+    private static final java.util.concurrent.atomic.AtomicBoolean FORCE_REBUILD_BUSY =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * Принудительная пересборка виртуальной сети в фоне (дебаг: Ctrl+R/T/G на карте).
+     *
+     * <p>Не блокирует клиент: расчёт идёт в {@link #INITIALIZER_EXECUTOR},
+     * результат публикуется в {@link RoadNetworkStore}, карта подхватывает
+     * новую ревизию сама. Повторные вызовы во время расчёта игнорируются.
+     *
+     * @param level  серверный мир
+     * @param center точка, вокруг которой досканировать поселения (позиция игрока)
+     * @return {@code false}, если пересборка уже идёт
+     */
+    public static boolean forceRebuildAsync(ServerLevel level, BlockPos center) {
+        if (level == null || !FORCE_REBUILD_BUSY.compareAndSet(false, true)) {
+            return false;
+        }
+        CompletableFuture.runAsync(() -> {
+            try {
+                WorldObjectManager manager = WorldObjectManagerApi.getManager(level);
+                if (manager == null) {
+                    return;
+                }
+                ChunkGenerator generator = level.getChunkSource().getGenerator();
+                RandomState randomState = level.getChunkSource().randomState();
+                long worldSeed = level.getChunkSource().getGeneratorState().getLevelSeed();
+                GenerationProgress.begin();
+                SeedStructureLookahead.predictKnotsInRange(manager, level, generator, randomState,
+                    center == null ? BlockPos.ZERO : center, 3500);
+                List<RoadNetworkBuilder.TownSeed> seeds = collectTownSeeds(manager, worldSeed);
+                long t0 = System.currentTimeMillis();
+                RoadStreamer.stopActive();
+                RoadNetwork network = RoadNetworkBuilder.build(seeds, worldSeed, generator, level, randomState);
+                publishAndStream(level, network);
+                manager.markNetworkInitialized();
+                LOGGER.info("[ServerNetworkInitializer] Принудительная пересборка ({}, геометрия {}) за {} мс: {} узлов, {} рёбер",
+                    RoadNetworkBuilder.topologyMode(), RoadNetworkBuilder.geometryMode(),
+                    System.currentTimeMillis() - t0, network.nodeCount(), network.edgeCount());
+            } catch (Exception e) {
+                LOGGER.error("[ServerNetworkInitializer] Ошибка принудительной пересборки", e);
+            } finally {
+                GenerationProgress.finish();
+                FORCE_REBUILD_BUSY.set(false);
+            }
+        }, INITIALIZER_EXECUTOR);
+        return true;
+    }
+
     /**
      * Собирает города из менеджера в плоские {@link RoadNetworkBuilder.TownSeed}.
      *
@@ -326,6 +394,7 @@ public final class ServerNetworkInitializer {
     public static void cleanup(ServerLevel level) {
         String dimensionKey = level.dimension().location().toString();
         GENERATION_FUTURES.remove(dimensionKey);
+        RoadStreamer.stopActive();
         LOGGER.debug("[ServerNetworkInitializer] Очищен кэш генерации для {}", dimensionKey);
     }
 }

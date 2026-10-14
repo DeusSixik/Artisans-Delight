@@ -75,9 +75,12 @@ public class MixinChunkGenerator$injectStructurePlace {
         BlockPos origin = sectionPos.origin();
         ChunkGenerator chunkGenerator = (ChunkGenerator) (Object) this;
 
-        // 1. Проверяем, был ли этот узел уже предсказан сид-лукахедом:
-        Optional<WorldObject> nearby = SeedStructureLookahead.findNearbyKnot(manager, origin, 128.0);
+        // 1. Проверяем, был ли этот узел уже предсказан сид-лукахедом.
+        // Проверка+создание — атомарно под TOWN_MUTEX: иначе конкурентный
+        // предикт вставляет дубль между findNearby и add (два пина рядом).
         WorldObject townKnot;
+        synchronized (SeedStructureLookahead.TOWN_MUTEX) {
+        Optional<WorldObject> nearby = SeedStructureLookahead.findNearbyKnot(manager, origin, 128.0);
 
         if (nearby.isPresent()) {
             townKnot = nearby.get();
@@ -107,6 +110,7 @@ public class MixinChunkGenerator$injectStructurePlace {
 
             manager.add(townKnot);
         }
+        } // end synchronized (TOWN_MUTEX)
 
         // 2. Сканируем и предсказываем соседние узлы по сиду мира (радиус 3000 блоков)
         SeedStructureLookahead.predictKnotsInRange(

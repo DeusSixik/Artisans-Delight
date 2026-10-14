@@ -66,14 +66,14 @@ public final class RoadNetworkBuilder {
      */
     private static final int CALC_THREADS = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() - 1));
 
-    /** Целевое число промежуточных узлов (адаптация шага сетки). */
-    private static final int MESH_TARGET_WAYPOINTS = 250;
-    /** Минимальный шаг поля (плотный BDO-меш). */
-    private static final int MESH_SPACING_MIN = 250;
-    /** Максимальный шаг поля (при широко разбросанных городах). */
-    private static final int MESH_SPACING_MAX = 400;
-    /** Жёсткий лимит числа промежуточных узлов (защита от взрывного перфа). */
-    private static final int MESH_MAX_WAYPOINTS = 400;
+    /**
+     * Фиксированный шаг поля узлов. Раньше шаг подстраивался под bbox городов,
+     * а это глобальное решение: поле зависело от того, какие города известны.
+     * Фиксированный шаг + хеш ячейки делают узел функцией только (сид, ячейка).
+     */
+    private static final int FIELD_STEP = 300;
+    /** Радиус поиска точки привязки узла вокруг джиттер-точки. */
+    private static final int FIELD_SNAP_RADIUS = 24;
     /** Отступ bbox городов для поля кандидатов. */
     private static final int MESH_MARGIN = 600;
     /** Джиттер ячейки (± доля шага). */
@@ -109,12 +109,80 @@ public final class RoadNetworkBuilder {
     private static final double MAX_TORTUOSITY = 1.6;
     /** Минимальный зазор между рёбрами — уже считается дублем/слипанием. */
     private static final double CORRIDOR_MIN_GAP = 35.0;
-    /** Зазор слияния: дороги ближе — это одна дорога, дубликат выкидывается. */
+    /** Зазор слияния: дороги ближе — кандидаты в дубликат (нужно ещё перекрытие). */
     private static final double CORRIDOR_MERGE_GAP = 90.0;
     /** Доля длины для счёта параллельности (медиана по сэмплам). */
     private static final double CORRIDOR_SAMPLE_STEP = 40.0;
+    /** Минимальная доля перекрытия проекций, чтобы параллельные дороги считать дублем. */
+    private static final double CORRIDOR_OVERLAP_FRACTION = 0.4;
+    /** Ячейка spatial-индекса деконфликтации (O(1) соседи вместо O(E²)). */
+    private static final double DECONFLICT_CELL = 250.0;
+
+    /** Алгоритм топологии узел–узел. */
+    public enum TopologyMode {
+        /** Граф относительного соседства: локальный, порядко-независимый (см. {@link MeshTopology}). */
+        RNG,
+        /** Старый жадный отбор: сортировка, лимит степени, ролл, пришивка компонент. Глобальный. */
+        GREEDY
+    }
+
+    /** Текущий алгоритм топологии (дебаг-переключатель Ctrl+T на карте). */
+    private static volatile TopologyMode topologyMode = TopologyMode.RNG;
+
+    /** Когда считается реальная геометрия дорог (A*). */
+    public enum GeometryMode {
+        /**
+         * Потоково: build() отдаёт узлы и ожидающие рёбра за секунды,
+         * дороги досчитываются по мере приближения игрока ({@code RoadStreamer}).
+         */
+        STREAM,
+        /** Вся карта сразу: A* всех рёбер + деконфликтация + гарантия связности (долго). */
+        FULL
+    }
+
+    /** Текущий режим геометрии (дебаг-переключатель Ctrl+G на карте). */
+    private static volatile GeometryMode geometryMode = GeometryMode.STREAM;
+
+    /**
+     * Самый длинный непрерывный участок воды на хорде, который ещё допускается.
+     * Реки уже́ — их A* перекрывает мостом; длиннее — море/широкое озеро,
+     * сухой дороги почти наверняка нет, ребро отсекается ещё до A*.
+     */
+    private static final double SEA_RUN_MAX = 96.0;
+    /** Шаг выборки воды вдоль хорды. */
+    private static final double SEA_SAMPLE_STEP = 16.0;
 
     private RoadNetworkBuilder() {
+    }
+
+    public static TopologyMode topologyMode() {
+        return topologyMode;
+    }
+
+    public static void topologyMode(TopologyMode mode) {
+        topologyMode = mode == null ? TopologyMode.RNG : mode;
+    }
+
+    public static GeometryMode geometryMode() {
+        return geometryMode;
+    }
+
+    public static void geometryMode(GeometryMode mode) {
+        geometryMode = mode == null ? GeometryMode.STREAM : mode;
+    }
+
+    /**
+     * Реальная геометрия одного ребра (A* по суше). Детерминирована: зависит
+     * только от концов и рельефа, поэтому порядок досчёта рёбер не важен.
+     *
+     * @return ребро с дорогой или {@code null}, если сухопутной дороги нет
+     */
+    public static RoadEdge computeEdgeGeometry(RoadNode from, RoadNode to,
+                                               ChunkGenerator generator,
+                                               LevelHeightAccessor height,
+                                               RandomState randomState) {
+        // worldSeed в buildEdge не участвует в расчёте пути (только рельеф).
+        return buildEdge(from, to, 0L, generator, height, randomState);
     }
 
     /**
@@ -134,7 +202,10 @@ public final class RoadNetworkBuilder {
      * Повторный расчёт для того же мира даёт те же id.
      */
     public static UUID townId(long worldSeed, int x, int z) {
-        String src = worldSeed + ":" + x + "," + z;
+        // По чанку, а не по блоку: предсказание ставит деревню в центр чанка
+        // структуры (cx·16+8), а реальная генерация — в его угол (cx·16).
+        // Чанк у обоих один, поэтому id не меняется при слиянии/уточнении.
+        String src = worldSeed + ":town:" + Math.floorDiv(x, 16) + "," + Math.floorDiv(z, 16);
         return UUID.nameUUIDFromBytes(src.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -143,6 +214,16 @@ public final class RoadNetworkBuilder {
      */
     public static UUID waypointId(long worldSeed, int index) {
         String src = worldSeed + ":waypoint:" + index;
+        return UUID.nameUUIDFromBytes(src.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Детерминированный id промежуточного узла от сида и ячейки поля.
+     * В отличие от {@link #waypointId(long, int)} не зависит от порядка
+     * обхода и размера области — узел ячейки всегда получает один и тот же id.
+     */
+    public static UUID waypointCellId(long worldSeed, int gx, int gz) {
+        String src = worldSeed + ":wp:" + gx + "," + gz;
         return UUID.nameUUIDFromBytes(src.getBytes(StandardCharsets.UTF_8));
     }
 
@@ -162,6 +243,7 @@ public final class RoadNetworkBuilder {
                                     LevelHeightAccessor height,
                                     RandomState randomState) {
         GenerationProgress.begin();
+        RoadCalcCache.ensureSeed(worldSeed);
 
         List<TownSeed> townList = towns == null ? List.of() : new ArrayList<>(towns);
         if (townList.size() < 2) {
@@ -175,29 +257,30 @@ public final class RoadNetworkBuilder {
             nodes.put(t.id(), new RoadNode(t.id(), RoadNode.Kind.TOWN, t.name(), t.x(), t.y(), t.z(), t.sourceId()));
         }
 
-        // 1. Поле промежуточных узлов (равномерно, только суша).
-        GenerationProgress.setStage(GenerationProgress.Stage.COARSE_GRAPH);
-        List<int[]> field = buildMeshField(townList, worldSeed, generator, height, randomState);
-        int waypointIndex = 0;
-        for (int[] c : field) {
-            waypointIndex++;
-            UUID nodeId = waypointId(worldSeed, waypointIndex);
-            nodes.put(nodeId, new RoadNode(nodeId, RoadNode.Kind.WAYPOINT,
-                "Перекрёсток #" + waypointIndex, c[0], c[1], c[2]));
-        }
-        LOGGER.info("[RoadNetworkBuilder] Поле меша: {} перекрёстков (шаг адаптивный {}–{})",
-            field.size(), MESH_SPACING_MIN, MESH_SPACING_MAX);
-
-        // 2. Топология узел–узел (короткие рёбра, степень ≤ 4, без пересечений, с ветвлениями).
-        Set<UUID> townIds = new HashSet<>();
+        // Ядро — область, за которую отвечает этот расчёт; ореол (LINK_RADIUS)
+        // нужен, чтобы рёбра узлов ядра у границы видели всех своих соседей.
+        // Так результат внутри ядра не зависит от размера области — основа
+        // будущей потоковой генерации по регионам.
+        int minX = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE;
+        int maxZ = Integer.MIN_VALUE;
         for (TownSeed t : townList) {
-            townIds.add(t.id());
+            minX = Math.min(minX, t.x());
+            maxX = Math.max(maxX, t.x());
+            minZ = Math.min(minZ, t.z());
+            maxZ = Math.max(maxZ, t.z());
         }
-        List<UUID[]> topoPairs = selectMeshLinks(nodes, townIds, worldSeed);
-        LOGGER.info("[RoadNetworkBuilder] Топология меша: {} рёбер для {} узлов",
-            topoPairs.size(), nodes.size());
+        final int coreMinX = minX - MESH_MARGIN;
+        final int coreMaxX = maxX + MESH_MARGIN;
+        final int coreMinZ = minZ - MESH_MARGIN;
+        final int coreMaxZ = maxZ + MESH_MARGIN;
+        int halo = (int) Math.ceil(LINK_RADIUS);
 
-        // 3. Геометрия рёбер ПАРАЛЛЕЛЬНО. Без дороги — ребро отбрасывается.
+        TopologyMode mode = topologyMode;
+        boolean preview = geometryMode == GeometryMode.STREAM;
+        long tStart = System.currentTimeMillis();
+
         java.util.concurrent.ExecutorService calcPool = java.util.concurrent.Executors.newFixedThreadPool(
             CALC_THREADS, r -> {
                 Thread t = new Thread(r, "ArtisansDelight-RoadCalc");
@@ -205,6 +288,82 @@ public final class RoadNetworkBuilder {
                 return t;
             });
         try {
+            // 1. Поле промежуточных узлов: функция (сид, ячейка), только суша.
+            GenerationProgress.setStage(GenerationProgress.Stage.COARSE_GRAPH);
+            List<FieldPoint> field = buildLocalField(
+                coreMinX - halo, coreMinZ - halo, coreMaxX + halo, coreMaxZ + halo,
+                townList, worldSeed, generator, height, randomState, calcPool);
+            for (FieldPoint p : field) {
+                UUID nodeId = waypointCellId(worldSeed, p.gx(), p.gz());
+                nodes.put(nodeId, new RoadNode(nodeId, RoadNode.Kind.WAYPOINT,
+                    "Перекрёсток " + p.gx() + ":" + p.gz(), p.x(), p.y(), p.z()));
+            }
+            long tField = System.currentTimeMillis();
+            LOGGER.info("[RoadNetworkBuilder] Поле меша: {} перекрёстков (шаг {}, ядро+ореол {}) за {} мс",
+                field.size(), FIELD_STEP, halo, tField - tStart);
+
+            // 2. Топология узел–узел.
+            Set<UUID> townIds = new HashSet<>();
+            for (TownSeed t : townList) {
+                townIds.add(t.id());
+            }
+            List<UUID[]> allPairs = mode == TopologyMode.RNG
+                ? rngLinks(nodes)
+                : selectMeshLinks(nodes, townIds, worldSeed);
+
+            // 2b. Обрезка по ядру: ребро наше, если хоть один конец в ядре.
+            // Узлы ореола остаются, только если на них опирается такое ребро.
+            List<UUID[]> topoPairs = new ArrayList<>(allPairs.size());
+            Set<UUID> referenced = new HashSet<>();
+            for (UUID[] pair : allPairs) {
+                RoadNode a = nodes.get(pair[0]);
+                RoadNode b = nodes.get(pair[1]);
+                if (inRect(a, coreMinX, coreMinZ, coreMaxX, coreMaxZ)
+                    || inRect(b, coreMinX, coreMinZ, coreMaxX, coreMaxZ)) {
+                    topoPairs.add(pair);
+                    referenced.add(pair[0]);
+                    referenced.add(pair[1]);
+                }
+            }
+            nodes.values().removeIf(n -> !n.isTown()
+                && !inRect(n, coreMinX, coreMinZ, coreMaxX, coreMaxZ)
+                && !referenced.contains(n.id()));
+            long tTopo = System.currentTimeMillis();
+            LOGGER.info("[RoadNetworkBuilder] Топология {} : {} рёбер для {} узлов за {} мс",
+                mode, topoPairs.size(), nodes.size(), tTopo - tField);
+
+            // 2c. Отсечение морских хорд: длинный сплошной участок воды на
+            // прямой — сухой дороги почти наверняка нет. Дёшево (выборка воды),
+            // параллельно. Окончательно ребро проверит A*.
+            topoPairs = dropSeaChords(topoPairs, nodes, generator, height, randomState, calcPool);
+            // Перекрёсток, у которого не осталось рёбер, — островок посреди воды.
+            Set<UUID> stillReferenced = new HashSet<>();
+            for (UUID[] pair : topoPairs) {
+                stillReferenced.add(pair[0]);
+                stillReferenced.add(pair[1]);
+            }
+            int before = nodes.size();
+            nodes.values().removeIf(n -> !n.isTown() && !stillReferenced.contains(n.id()));
+            long tSea = System.currentTimeMillis();
+            LOGGER.info("[RoadNetworkBuilder] Отсечение моря: осталось {} рёбер, убрано {} узлов-островков за {} мс",
+                topoPairs.size(), before - nodes.size(), tSea - tTopo);
+
+            // 2d. Потоковый режим: узлы + ожидающие рёбра (хорды-заглушки).
+            // Реальные дороги досчитает RoadStreamer по мере приближения игрока.
+            if (preview) {
+                Map<String, RoadEdge> pendingEdges = new LinkedHashMap<>();
+                for (UUID[] pair : topoPairs) {
+                    RoadEdge e = straightEdge(nodes.get(pair[0]), nodes.get(pair[1]));
+                    pendingEdges.put(e.key(), e);
+                }
+                GenerationProgress.finish();
+                RoadNetwork network = new RoadNetwork(worldSeed, nodes, pendingEdges);
+                LOGGER.info("[RoadNetworkBuilder] Каркас сети {} : {} узлов, {} ожидающих рёбер, всего {} мс",
+                    mode, network.nodeCount(), network.edgeCount(), System.currentTimeMillis() - tStart);
+                return network;
+            }
+
+            // 3. Геометрия рёбер ПАРАЛЛЕЛЬНО. Без дороги — ребро отбрасывается.
             Map<String, RoadEdge> edges = buildMeshEdgesParallel(
                 topoPairs, nodes, worldSeed, generator, height, randomState, calcPool);
 
@@ -212,11 +371,13 @@ public final class RoadNetworkBuilder {
             // кривизну дорог — две хорды расходятся, а полилинии по факту крестятся,
             // идут дублями или петляют. Проверяем полилинии друг о друга: кресты,
             // сближения и петли выкидываются до гарантии связности.
-            // Порядок детерминирован: сначала бывшие хорд-пересечения, потом короткие.
+            // Spatial-индекс: соседи ищутся по ячейкам, а не перебором всех пар.
+            GenerationProgress.setStage(GenerationProgress.Stage.FINE_GEOMETRY);
             List<RoadEdge> geoList = new ArrayList<>(edges.values());
             geoList.sort(Comparator.comparingDouble((RoadEdge e) -> chordLength(nodes, e))
                 .thenComparing(RoadEdge::key));
-            java.util.Set<String> dropped = deconflictGeometry(geoList);
+            java.util.Set<String> dropped = deconflictGeometry(geoList, (done, total) ->
+                GenerationProgress.setProgress(done, total, "Деконфликтация"));
             for (String key : dropped) {
                 edges.remove(key);
             }
@@ -241,84 +402,284 @@ public final class RoadNetworkBuilder {
     }
 
     // =========================================================================
-    // Поле узлов: джиттер-сетка поверх bbox городов, только суша
+    // Поле узлов: функция (сид, ячейка), порядко-независимое прореживание
     // =========================================================================
 
-    private static List<int[]> buildMeshField(List<TownSeed> townList,
-                                              long worldSeed,
-                                              ChunkGenerator generator,
-                                              LevelHeightAccessor height,
-                                              RandomState randomState) {
-        int minX = Integer.MAX_VALUE;
-        int maxX = Integer.MIN_VALUE;
-        int minZ = Integer.MAX_VALUE;
-        int maxZ = Integer.MIN_VALUE;
-        for (TownSeed t : townList) {
-            if (t.x() < minX) minX = t.x();
-            if (t.x() > maxX) maxX = t.x();
-            if (t.z() < minZ) minZ = t.z();
-            if (t.z() > maxZ) maxZ = t.z();
+    /** Узел поля: ячейка сетки и привязанная к суше позиция. */
+    private record FieldPoint(int gx, int gz, int x, int y, int z) {
+    }
+
+    /**
+     * Строит поле промежуточных узлов в прямоугольнике.
+     *
+     * <p><b>Локальность.</b> Кандидат ячейки {@code (gx, gz)} — функция только
+     * от сида, ячейки и рельефа:
+     * <pre>
+     *   base = (gx·S + S/2,  gz·S + S/2)
+     *   jitter = (2u − 1) · S · J,   u ∈ [0, 1) из хеша ячейки
+     * </pre>
+     * где {@code S} — {@link #FIELD_STEP}, {@code J} — {@link #MESH_JITTER}.
+     * Затем точка привязывается к удобному рельефу в радиусе
+     * {@link #FIELD_SNAP_RADIUS}; вода и окрестность городов отбрасываются.
+     *
+     * <p><b>Прореживание.</b> Раньше узел отбрасывался, если рядом уже принят
+     * другой — результат зависел от порядка обхода. Теперь у каждой ячейки
+     * хеш-приоритет, и кандидат выживает, если среди валидных кандидатов
+     * ближе {@link #WAYPOINT_SEPARATION} нет более приоритетного. Такие
+     * соседи лежат только в соседних ячейках (3×3): максимальный сдвиг от
+     * центра ячейки {@code S·J + snap ≈ 129 < (2S − 150)/2}.
+     *
+     * @return узлы поля в прямоугольнике (порядок: gx, затем gz)
+     */
+    private static List<FieldPoint> buildLocalField(int minX, int minZ, int maxX, int maxZ,
+                                                    List<TownSeed> towns,
+                                                    long worldSeed,
+                                                    ChunkGenerator generator,
+                                                    LevelHeightAccessor height,
+                                                    RandomState randomState,
+                                                    java.util.concurrent.ExecutorService pool) {
+        int gx0 = Math.floorDiv(minX, FIELD_STEP);
+        int gx1 = Math.floorDiv(maxX, FIELD_STEP);
+        int gz0 = Math.floorDiv(minZ, FIELD_STEP);
+        int gz1 = Math.floorDiv(maxZ, FIELD_STEP);
+        // +1 кольцо ячеек: нужно только для проверки прореживания у края.
+        int rx0 = gx0 - 1;
+        int rz0 = gz0 - 1;
+        int w = gx1 - gx0 + 3;
+        int h = gz1 - gz0 + 3;
+        FieldPoint[][] cand = new FieldPoint[w][h];
+
+        // Кандидаты считаются параллельно по столбцам: ячейки независимы.
+        java.util.concurrent.atomic.AtomicInteger cols = new java.util.concurrent.atomic.AtomicInteger();
+        List<java.util.concurrent.Future<?>> futures = new ArrayList<>(w);
+        for (int ix = 0; ix < w; ix++) {
+            final int col = ix;
+            futures.add(pool.submit(() -> {
+                int gx = rx0 + col;
+                for (int iz = 0; iz < h; iz++) {
+                    cand[col][iz] = fieldCandidate(gx, rz0 + iz, towns, worldSeed,
+                        generator, height, randomState);
+                }
+                GenerationProgress.setProgress(cols.incrementAndGet(), w, "Поле узлов");
+            }));
         }
-
-        long areaW = (long) (maxX - minX) + 2L * MESH_MARGIN;
-        long areaH = (long) (maxZ - minZ) + 2L * MESH_MARGIN;
-        int step = (int) Math.sqrt((double) areaW * (double) areaH / MESH_TARGET_WAYPOINTS);
-        step = Math.max(MESH_SPACING_MIN, Math.min(MESH_SPACING_MAX, step));
-
-        int gx0 = Math.floorDiv(minX - MESH_MARGIN, step);
-        int gx1 = Math.floorDiv(maxX + MESH_MARGIN, step);
-        int gz0 = Math.floorDiv(minZ - MESH_MARGIN, step);
-        int gz1 = Math.floorDiv(maxZ + MESH_MARGIN, step);
-        int totalCells = (gx1 - gx0 + 1) * (gz1 - gz0 + 1);
-
-        List<int[]> accepted = new ArrayList<>();
-        int visited = 0;
-        for (int gx = gx0; gx <= gx1; gx++) {
-            for (int gz = gz0; gz <= gz1; gz++) {
-                visited++;
-                if (visited % 25 == 0) {
-                    GenerationProgress.setProgress(visited, totalCells, "Поле узлов");
-                }
-                if (accepted.size() >= MESH_MAX_WAYPOINTS) {
-                    continue;
-                }
-
-                Random cellRng = new Random(worldSeed ^ (gx * 73856093L ^ gz * 19349663L));
-                int baseX = gx * step + step / 2;
-                int baseZ = gz * step + step / 2;
-                int jx = baseX + (int) Math.round((cellRng.nextDouble() * 2.0 - 1.0) * step * MESH_JITTER);
-                int jz = baseZ + (int) Math.round((cellRng.nextDouble() * 2.0 - 1.0) * step * MESH_JITTER);
-
-                if (nearTown(townList, jx, jz, TOWN_CLEARANCE)) {
-                    continue;
-                }
-                if (nearAccepted(accepted, jx, jz, WAYPOINT_SEPARATION)) {
-                    continue;
-                }
-
-                BlockPos snapped = SectorWaypointPicker.pickWaypointNear(
-                    jx, jz, 24,
-                    worldSeed ^ ((long) jx * 31L + jz),
-                    generator, height, randomState);
-                if (snapped == null) {
-                    continue;
-                }
-                int sx = snapped.getX();
-                int sz = snapped.getZ();
-                if (nearTown(townList, sx, sz, TOWN_CLEARANCE)) {
-                    continue;
-                }
-                if (nearAccepted(accepted, sx, sz, WAYPOINT_SEPARATION)) {
-                    continue;
-                }
-                if (TerrainSampler.isWater(generator, height, randomState, sx, sz)) {
-                    continue;
-                }
-                accepted.add(new int[]{sx, snapped.getY(), sz});
+        for (java.util.concurrent.Future<?> f : futures) {
+            try {
+                f.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Field calc interrupted", e);
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new RuntimeException("Field calc failed", e.getCause());
             }
         }
-        GenerationProgress.setProgress(totalCells, totalCells, "Поле узлов: " + accepted.size());
-        return accepted;
+
+        double sep2 = WAYPOINT_SEPARATION * WAYPOINT_SEPARATION;
+        List<FieldPoint> out = new ArrayList<>();
+        for (int ix = 1; ix < w - 1; ix++) {
+            for (int iz = 1; iz < h - 1; iz++) {
+                FieldPoint c = cand[ix][iz];
+                if (c == null) {
+                    continue;
+                }
+                long pc = fieldPriority(worldSeed, c);
+                boolean suppressed = false;
+                for (int dx = -1; dx <= 1 && !suppressed; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx == 0 && dz == 0) {
+                            continue;
+                        }
+                        FieldPoint o = cand[ix + dx][iz + dz];
+                        if (o == null) {
+                            continue;
+                        }
+                        double ddx = (double) o.x() - c.x();
+                        double ddz = (double) o.z() - c.z();
+                        if (ddx * ddx + ddz * ddz >= sep2) {
+                            continue;
+                        }
+                        if (fieldPriority(worldSeed, o) > pc) {
+                            suppressed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!suppressed) {
+                    out.add(c);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Кандидат ячейки или {@code null} (вода / рядом город). */
+    private static FieldPoint fieldCandidate(int gx, int gz,
+                                             List<TownSeed> towns,
+                                             long worldSeed,
+                                             ChunkGenerator generator,
+                                             LevelHeightAccessor height,
+                                             RandomState randomState) {
+        // Сырой кандидат (рельеф) кэшируется: он не зависит от городов.
+        // Отступ от городов применяется поверх — города могут добавляться.
+        int[] raw = RoadCalcCache.field(gx, gz);
+        if (raw == null) {
+            raw = rawFieldCandidate(gx, gz, worldSeed, generator, height, randomState);
+            RoadCalcCache.putField(gx, gz, raw);
+        }
+        if (raw[5] != 0) {
+            return null; // вода
+        }
+        if (nearTown(towns, raw[0], raw[1], TOWN_CLEARANCE)
+            || nearTown(towns, raw[2], raw[4], TOWN_CLEARANCE)) {
+            return null;
+        }
+        return new FieldPoint(gx, gz, raw[2], raw[3], raw[4]);
+    }
+
+    /** Кандидат ячейки только по рельефу: {@code {jx, jz, sx, sy, sz, water}}. */
+    private static int[] rawFieldCandidate(int gx, int gz,
+                                           long worldSeed,
+                                           ChunkGenerator generator,
+                                           LevelHeightAccessor height,
+                                           RandomState randomState) {
+        long hc = MeshTopology.cellHash(worldSeed, gx, gz);
+        double u1 = (hc >>> 11) * 0x1.0p-53;
+        double u2 = (MeshTopology.mix64(hc) >>> 11) * 0x1.0p-53;
+        int jx = gx * FIELD_STEP + FIELD_STEP / 2
+            + (int) Math.round((u1 * 2.0 - 1.0) * FIELD_STEP * MESH_JITTER);
+        int jz = gz * FIELD_STEP + FIELD_STEP / 2
+            + (int) Math.round((u2 * 2.0 - 1.0) * FIELD_STEP * MESH_JITTER);
+        BlockPos snapped = SectorWaypointPicker.pickWaypointNear(
+            jx, jz, FIELD_SNAP_RADIUS, hc, generator, height, randomState);
+        int sx = snapped.getX();
+        int sz = snapped.getZ();
+        boolean water = TerrainSampler.isWater(generator, height, randomState, sx, sz);
+        return new int[]{jx, jz, sx, snapped.getY(), sz, water ? 1 : 0};
+    }
+
+    /** Приоритет прореживания: хеш ячейки; ничья невозможна для разных ячеек на практике. */
+    private static long fieldPriority(long worldSeed, FieldPoint p) {
+        return MeshTopology.mix64(MeshTopology.cellHash(worldSeed, p.gx(), p.gz()) ^ 0x5DEECE66DL);
+    }
+
+    /**
+     * Рёбра RNG по всем узлам. Порядок узлов фиксирован (сортировка по id),
+     * поэтому и порядок рёбер детерминирован.
+     */
+    private static List<UUID[]> rngLinks(Map<UUID, RoadNode> nodes) {
+        List<UUID> ids = new ArrayList<>(nodes.keySet());
+        ids.sort(Comparator.comparing(UUID::toString));
+        double[] xs = new double[ids.size()];
+        double[] zs = new double[ids.size()];
+        for (int i = 0; i < ids.size(); i++) {
+            RoadNode n = nodes.get(ids.get(i));
+            xs[i] = n.x();
+            zs[i] = n.z();
+        }
+        List<int[]> idx = MeshTopology.relativeNeighborhoodEdges(xs, zs, MIN_LINK_DIST, LINK_RADIUS);
+        List<UUID[]> out = new ArrayList<>(idx.size());
+        for (int[] e : idx) {
+            out.add(new UUID[]{ids.get(e[0]), ids.get(e[1])});
+        }
+        return out;
+    }
+
+    private static boolean inRect(RoadNode n, int minX, int minZ, int maxX, int maxZ) {
+        return n != null && n.x() >= minX && n.x() <= maxX && n.z() >= minZ && n.z() <= maxZ;
+    }
+
+    /** Ожидающее ребро: прямая хорда-заглушка до расчёта реальной дороги. */
+    private static RoadEdge straightEdge(RoadNode a, RoadNode b) {
+        List<RoadPoint2D> g = List.of(new RoadPoint2D(a.x(), a.z(), false),
+            new RoadPoint2D(b.x(), b.z(), false));
+        double d = Math.hypot((double) a.x() - b.x(), (double) a.z() - b.z());
+        return new RoadEdge(a.id(), b.id(), g, false, d, true);
+    }
+
+    /**
+     * Убирает рёбра, чья прямая хорда пересекает воду сплошным участком
+     * длиннее {@link #SEA_RUN_MAX}. Проверка параллельная, порядок рёбер
+     * в результате сохраняется.
+     */
+    private static List<UUID[]> dropSeaChords(List<UUID[]> pairs,
+                                              Map<UUID, RoadNode> nodes,
+                                              ChunkGenerator generator,
+                                              LevelHeightAccessor height,
+                                              RandomState randomState,
+                                              java.util.concurrent.ExecutorService pool) {
+        int total = pairs.size();
+        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+        List<java.util.concurrent.Future<Boolean>> futures = new ArrayList<>(total);
+        for (UUID[] pair : pairs) {
+            RoadNode a = nodes.get(pair[0]);
+            RoadNode b = nodes.get(pair[1]);
+            futures.add(pool.submit(() -> {
+                boolean sea;
+                if (a == null || b == null) {
+                    sea = true;
+                } else {
+                    Boolean cached = RoadCalcCache.sea(a, b);
+                    if (cached != null) {
+                        sea = cached;
+                    } else {
+                        sea = chordCrossesSea(a, b, generator, height, randomState);
+                        RoadCalcCache.putSea(a, b, sea);
+                    }
+                }
+                int d = done.incrementAndGet();
+                if (d % 20 == 0 || d == total) {
+                    GenerationProgress.setProgress(d, total, "Проверка воды");
+                }
+                return sea;
+            }));
+        }
+        List<UUID[]> out = new ArrayList<>(total);
+        for (int i = 0; i < total; i++) {
+            try {
+                if (!futures.get(i).get()) {
+                    out.add(pairs.get(i));
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Sea check interrupted", e);
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new RuntimeException("Sea check failed", e.getCause());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Есть ли на хорде {@code a–b} сплошной участок воды длиннее
+     * {@link #SEA_RUN_MAX}. Выборка с шагом {@link #SEA_SAMPLE_STEP}, концы
+     * не проверяются (узлы и так на суше):
+     * <pre>
+     *   p(t) = a + t·(b − a),   t = i / n,   n = ⌈|ab| / step⌉
+     *   run  += step, пока p(t) в воде;  иначе run = 0
+     * </pre>
+     */
+    private static boolean chordCrossesSea(RoadNode a, RoadNode b,
+                                           ChunkGenerator generator,
+                                           LevelHeightAccessor height,
+                                           RandomState randomState) {
+        double len = Math.hypot((double) a.x() - b.x(), (double) a.z() - b.z());
+        int n = Math.max(2, (int) Math.ceil(len / SEA_SAMPLE_STEP));
+        double step = len / n;
+        double run = 0.0;
+        for (int i = 1; i < n; i++) {
+            double t = (double) i / n;
+            int x = (int) Math.round(a.x() + (b.x() - a.x()) * t);
+            int z = (int) Math.round(a.z() + (b.z() - a.z()) * t);
+            if (TerrainSampler.isWater(generator, height, randomState, x, z)) {
+                run += step;
+                if (run > SEA_RUN_MAX) {
+                    return true;
+                }
+            } else {
+                run = 0.0;
+            }
+        }
+        return false;
     }
 
     private static boolean nearTown(List<TownSeed> towns, int x, int z, double radius) {
@@ -326,18 +687,6 @@ public final class RoadNetworkBuilder {
         for (TownSeed t : towns) {
             double dx = (double) t.x() - x;
             double dz = (double) t.z() - z;
-            if (dx * dx + dz * dz < r2) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean nearAccepted(List<int[]> accepted, int x, int z, double radius) {
-        double r2 = radius * radius;
-        for (int[] c : accepted) {
-            double dx = (double) c[0] - x;
-            double dz = (double) c[2] - z;
             if (dx * dx + dz * dz < r2) {
                 return true;
             }
@@ -572,12 +921,33 @@ public final class RoadNetworkBuilder {
         List<RoadEdge> liveEdges = new ArrayList<>(edges.values());
         int repaired = 0;
         List<UUID> unrepairable = new ArrayList<>();
+        // Живой spatial-индекс: ремонт сирот идёт через него, а не перебором всех пар.
+        Map<Long, List<RoadEdge>> liveGrid = new HashMap<>(liveEdges.size() * 2 + 16);
+        Map<String, List<double[]>> livePolys = new HashMap<>(liveEdges.size() * 2 + 16);
+        Map<String, double[]> liveBoxes = new HashMap<>(liveEdges.size() * 2 + 16);
+        for (RoadEdge e : liveEdges) {
+            List<double[]> poly = toPoly(e);
+            livePolys.put(e.key(), poly);
+            double[] box = polyBbox(poly);
+            liveBoxes.put(e.key(), box);
+            insertIntoGrid(liveGrid, e, box);
+        }
+        int orphanDone = 0;
+        int orphanTotal = orphans.size();
         for (UUID orphan : orphans) {
+            orphanDone++;
+            GenerationProgress.setProgress(orphanDone, orphanTotal, "Ремонт сирот");
             RoadEdge fixed = repairOrphan(orphan, townIds, nodes, pos, degree, liveEdges,
+                liveGrid, livePolys, liveBoxes,
                 worldSeed, generator, height, randomState);
             if (fixed != null) {
                 edges.put(fixed.key(), fixed);
                 liveEdges.add(fixed);
+                List<double[]> poly = toPoly(fixed);
+                livePolys.put(fixed.key(), poly);
+                double[] box = polyBbox(poly);
+                liveBoxes.put(fixed.key(), box);
+                insertIntoGrid(liveGrid, fixed, box);
                 degree.put(fixed.fromId(), degree.getOrDefault(fixed.fromId(), 0) + 1);
                 degree.put(fixed.toId(), degree.getOrDefault(fixed.toId(), 0) + 1);
                 repaired++;
@@ -604,6 +974,9 @@ public final class RoadNetworkBuilder {
                                          Map<UUID, double[]> pos,
                                          Map<UUID, Integer> degree,
                                          List<RoadEdge> liveEdges,
+                                         Map<Long, List<RoadEdge>> liveGrid,
+                                         Map<String, List<double[]>> livePolys,
+                                         Map<String, double[]> liveBoxes,
                                          long worldSeed,
                                          ChunkGenerator generator,
                                          LevelHeightAccessor height,
@@ -645,7 +1018,7 @@ public final class RoadNetworkBuilder {
                 continue;
             }
             RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
-            if (edge != null && !conflictsLiveGeometry(edge, liveEdges)) {
+            if (edge != null && !conflictsLiveGeometry(edge, liveEdges, liveGrid, livePolys, liveBoxes)) {
                 return edge;
             }
         }
@@ -696,7 +1069,11 @@ public final class RoadNetworkBuilder {
         // Маленькие waypoint-компоненты без городов (одиночки/пары от ремонта)
         // не трогаем: это и есть разрешённые BDO-ветки. Сшиваем только города.
         int stitched = 0;
+        int townCompDone = 0;
+        int townCompTotal = townComponents.size();
         for (List<UUID> members : townComponents) {
+            townCompDone++;
+            GenerationProgress.setProgress(townCompDone, townCompTotal, "Сшивка городов");
             UUID[] pair = findLiveBridge(members, mainSet, pos, liveEdges, degree, ORPHAN_TOWN_RADIUS);
             if (pair == null) {
                 LOGGER.warn("[RoadNetworkBuilder] Компонента с городом осталась изолированной ({} узлов)", members.size());
@@ -766,17 +1143,68 @@ public final class RoadNetworkBuilder {
      * Проверяет кандидата с готовой геометрией против живых рёбер: крест
      * полилиний, дубль коридоров или петля у чужого узла — кандидат отклоняется.
      * Общий узел — не конфликт (слияние в точке — норма, скрин 1 справа).
+     * Соседи берутся из spatial-индекса, полилинии/bbox — из кэшей.
      */
     private static boolean conflictsLiveGeometry(RoadEdge edge, List<RoadEdge> liveEdges) {
-        List<double[]> poly = toPoly(edge);
-        for (RoadEdge k : liveEdges) {
+        return conflictsLiveGeometry(edge, liveEdges, null, null, null);
+    }
+
+    private static boolean conflictsLiveGeometry(RoadEdge edge,
+                                                 List<RoadEdge> liveEdges,
+                                                 Map<Long, List<RoadEdge>> liveGrid,
+                                                 Map<String, List<double[]>> livePolys,
+                                                 Map<String, double[]> liveBoxes) {
+        List<double[]> poly = livePolys != null
+            ? livePolys.computeIfAbsent(edge.key(), k -> toPoly(edge))
+            : toPoly(edge);
+        double[] box = liveBoxes != null
+            ? liveBoxes.computeIfAbsent(edge.key(), k -> polyBbox(poly))
+            : polyBbox(poly);
+        java.util.Collection<RoadEdge> candidates;
+        if (liveGrid != null) {
+            java.util.Set<RoadEdge> neighbours = collectNeighbours(liveGrid, box, CORRIDOR_MERGE_GAP);
+            if (!neighbours.contains(edge)) {
+                // Рёбра с общим узлом могут лежать вне ячеек bbox — их проверяем отдельно.
+                List<RoadEdge> withShared = new ArrayList<>(neighbours.size() + 4);
+                for (RoadEdge k : liveEdges) {
+                    if (k.key().equals(edge.key())) {
+                        continue;
+                    }
+                    if (edge.connects(k.fromId()) || edge.connects(k.toId())) {
+                        withShared.add(k);
+                    }
+                }
+                withShared.addAll(neighbours);
+                withShared.sort(Comparator.comparing(RoadEdge::key));
+                candidates = withShared;
+            } else {
+                List<RoadEdge> sorted = new ArrayList<>(neighbours);
+                sorted.sort(Comparator.comparing(RoadEdge::key));
+                candidates = sorted;
+            }
+        } else {
+            candidates = liveEdges;
+        }
+        for (RoadEdge k : candidates) {
+            if (k.key().equals(edge.key())) {
+                continue;
+            }
             if (edge.connects(k.fromId()) || edge.connects(k.toId())) {
-                if (loopsAtFreeEnd(poly, edge, k)) {
+                if (loopsAtFreeEnd(poly, edge, k, livePolys)) {
                     return true;
                 }
                 continue;
             }
-            if (polysCross(poly, toPoly(k)) || corridorsOverlap(poly, toPoly(k))) {
+            List<double[]> kPoly = livePolys != null
+                ? livePolys.computeIfAbsent(k.key(), kk -> toPoly(k))
+                : toPoly(k);
+            double[] kBox = liveBoxes != null
+                ? liveBoxes.computeIfAbsent(k.key(), kk -> polyBbox(kPoly))
+                : polyBbox(kPoly);
+            if (!boxesOverlap(box, kBox, CORRIDOR_MERGE_GAP)) {
+                continue;
+            }
+            if (polysCross(poly, kPoly) || corridorsOverlap(poly, kPoly)) {
                 return true;
             }
         }
@@ -938,27 +1366,51 @@ public final class RoadNetworkBuilder {
      * (слияние в узле — это хорошо, скрин 1 справа).
      *
      * @param ordered рёбра в порядке рассмотрения (мутируется только чтением)
+     * @param progress обратный вызов прогресса (done, total), может быть {@code null}
      * @return ключи выкинутых рёбер
      */
-    private static java.util.Set<String> deconflictGeometry(List<RoadEdge> ordered) {
+    private static java.util.Set<String> deconflictGeometry(List<RoadEdge> ordered,
+                                                            java.util.function.BiConsumer<Integer, Integer> progress) {
         java.util.Set<String> dropped = new HashSet<>();
         List<RoadEdge> kept = new ArrayList<>();
-        Map<String, List<double[]>> polyCache = new HashMap<>();
+        // Полилинии, bbox и ячейки индекса — всё предрасчитано один раз.
+        Map<String, List<double[]>> polyCache = new HashMap<>(ordered.size() * 2);
+        Map<String, double[]> bboxCache = new HashMap<>(ordered.size() * 2);
         for (RoadEdge e : ordered) {
-            List<double[]> poly = polyCache.computeIfAbsent(e.key(), k -> toPoly(e));
+            List<double[]> poly = toPoly(e);
+            polyCache.put(e.key(), poly);
+            bboxCache.put(e.key(), polyBbox(poly));
+        }
+        Map<Long, List<RoadEdge>> grid = new HashMap<>(kept.size() * 2 + 16);
+        int done = 0;
+        int total = ordered.size();
+        for (RoadEdge e : ordered) {
+            done++;
+            if (progress != null && (done % 10 == 0 || done == total)) {
+                progress.accept(done, total);
+            }
+            List<double[]> poly = polyCache.get(e.key());
+            double[] box = bboxCache.get(e.key());
             boolean conflict = false;
-            for (RoadEdge k : kept) {
+            // Соседи только из перекрывающихся ячеек (с запасом на коридор).
+            java.util.Set<RoadEdge> neighbours = collectNeighbours(grid, box, CORRIDOR_MERGE_GAP);
+            List<RoadEdge> sortedNeighbours = new ArrayList<>(neighbours);
+            sortedNeighbours.sort(Comparator.comparing(RoadEdge::key));
+            for (RoadEdge k : sortedNeighbours) {
                 if (e.connects(k.fromId()) || e.connects(k.toId())) {
                     // Общий узел: слияние дорог в точке — норма (скрин 1 справа).
                     // Проверяем только петлю: заход чужой геометрии вплотную к
                     // нашему свободному концу (скрин 1 слева).
-                    if (loopsAtFreeEnd(poly, e, k)) {
+                    if (loopsAtFreeEnd(poly, e, k, polyCache)) {
                         conflict = true;
                         break;
                     }
                     continue;
                 }
-                List<double[]> kPoly = polyCache.computeIfAbsent(k.key(), kk -> toPoly(k));
+                List<double[]> kPoly = polyCache.get(k.key());
+                if (!boxesOverlap(box, bboxCache.get(k.key()), CORRIDOR_MERGE_GAP)) {
+                    continue;
+                }
                 if (polysCross(poly, kPoly) || corridorsOverlap(poly, kPoly)) {
                     conflict = true;
                     break;
@@ -968,9 +1420,70 @@ public final class RoadNetworkBuilder {
                 dropped.add(e.key());
             } else {
                 kept.add(e);
+                insertIntoGrid(grid, e, box);
             }
         }
         return dropped;
+    }
+
+    /** Bbox полилинии [minX, minY, maxX, maxY]. */
+    private static double[] polyBbox(List<double[]> poly) {
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        for (double[] p : poly) {
+            if (p[0] < minX) minX = p[0];
+            if (p[1] < minY) minY = p[1];
+            if (p[0] > maxX) maxX = p[0];
+            if (p[1] > maxY) maxY = p[1];
+        }
+        return new double[]{minX, minY, maxX, maxY};
+    }
+
+    /** Пересекаются ли bbox с запасом margin. */
+    private static boolean boxesOverlap(double[] a, double[] b, double margin) {
+        if (a == null || b == null) {
+            return true;
+        }
+        return a[2] + margin >= b[0] && b[2] + margin >= a[0]
+            && a[3] + margin >= b[1] && b[3] + margin >= a[1];
+    }
+
+    private static long cellKey(long cx, long cz) {
+        return (cx << 32) ^ (cz & 0xFFFFFFFFL);
+    }
+
+    /** Кладёт ребро во все ячейки, перекрываемые его bbox (+запас на коридор). */
+    private static void insertIntoGrid(Map<Long, List<RoadEdge>> grid, RoadEdge e, double[] box) {
+        long x0 = (long) Math.floor((box[0] - CORRIDOR_MERGE_GAP) / DECONFLICT_CELL);
+        long x1 = (long) Math.floor((box[2] + CORRIDOR_MERGE_GAP) / DECONFLICT_CELL);
+        long z0 = (long) Math.floor((box[1] - CORRIDOR_MERGE_GAP) / DECONFLICT_CELL);
+        long z1 = (long) Math.floor((box[3] + CORRIDOR_MERGE_GAP) / DECONFLICT_CELL);
+        for (long cx = x0; cx <= x1; cx++) {
+            for (long cz = z0; cz <= z1; cz++) {
+                grid.computeIfAbsent(cellKey(cx, cz), k -> new ArrayList<>()).add(e);
+            }
+        }
+    }
+
+    /** Собирает уникальных соседей из ячеек, перекрываемых bbox (+запас). */
+    private static java.util.Set<RoadEdge> collectNeighbours(Map<Long, List<RoadEdge>> grid,
+                                                             double[] box, double margin) {
+        java.util.Set<RoadEdge> out = new HashSet<>();
+        long x0 = (long) Math.floor((box[0] - margin) / DECONFLICT_CELL);
+        long x1 = (long) Math.floor((box[2] + margin) / DECONFLICT_CELL);
+        long z0 = (long) Math.floor((box[1] - margin) / DECONFLICT_CELL);
+        long z1 = (long) Math.floor((box[3] + margin) / DECONFLICT_CELL);
+        for (long cx = x0; cx <= x1; cx++) {
+            for (long cz = z0; cz <= z1; cz++) {
+                List<RoadEdge> cell = grid.get(cellKey(cx, cz));
+                if (cell != null) {
+                    out.addAll(cell);
+                }
+            }
+        }
+        return out;
     }
 
     /** Длина прямой хорды ребра (для детерминированного порядка деконфликтации). */
@@ -1009,13 +1522,36 @@ public final class RoadNetworkBuilder {
     }
 
     /**
-     * Слипание коридоров: медианное расстояние между полилиниями меньше
-     * {@link #CORRIDOR_MERGE_GAP} — это дубль одной дороги (скрин 3),
-     * а не два независимых пути.
+     * Слипание коридоров: дороги идут рядом (медиана &lt; {@link #CORRIDOR_MERGE_GAP})
+     * И перекрываются вдоль ({@link #CORRIDOR_OVERLAP_FRACTION}) — это дубль одной
+     * дороги (скрин 3). Просто близкие, но расходящиеся пути (Y-развилка) не трогаем:
+     * у них перекрытие проекций маленькое.
      */
     private static boolean corridorsOverlap(List<double[]> a, List<double[]> b) {
         double med = medianMinDistance(a, b);
-        return med < CORRIDOR_MERGE_GAP;
+        if (med >= CORRIDOR_MERGE_GAP) {
+            return false;
+        }
+        return projectionOverlap(a, b) >= CORRIDOR_OVERLAP_FRACTION
+            || projectionOverlap(b, a) >= CORRIDOR_OVERLAP_FRACTION;
+    }
+
+    /**
+     * Доля сэмплов A, чья проекция падает на отрезки B в пределах зазора слияния.
+     * Параллельный дубль даёт ~1.0, Y-развилка — маленькую долю (общий ствол).
+     */
+    private static double projectionOverlap(List<double[]> a, List<double[]> b) {
+        List<double[]> samples = samplePoly(a, CORRIDOR_SAMPLE_STEP);
+        if (samples.isEmpty() || b.size() < 2) {
+            return 0.0;
+        }
+        int hit = 0;
+        for (double[] s : samples) {
+            if (distToPoly(s, b) < CORRIDOR_MERGE_GAP) {
+                hit++;
+            }
+        }
+        return (double) hit / samples.size();
     }
 
     /** Медиана минимальных расстояний от сэмплов A до полилинии B. */
@@ -1086,8 +1622,11 @@ public final class RoadNetworkBuilder {
      * ({@link #CORRIDOR_MIN_GAP}) к свободному концу соседа — узел петли
      * (скрин 1 слева). Общий конец игнорируется: слияние в нём — норма.
      */
-    private static boolean loopsAtFreeEnd(List<double[]> poly, RoadEdge e, RoadEdge kept) {
-        List<double[]> kPoly = toPoly(kept);
+    private static boolean loopsAtFreeEnd(List<double[]> poly, RoadEdge e, RoadEdge kept,
+                                           Map<String, List<double[]>> polyCache) {
+        List<double[]> kPoly = polyCache != null
+            ? polyCache.computeIfAbsent(kept.key(), kk -> toPoly(kept))
+            : toPoly(kept);
         UUID sharedA = e.fromId().equals(kept.fromId()) || e.fromId().equals(kept.toId()) ? e.fromId() : null;
         UUID sharedB = e.toId().equals(kept.fromId()) || e.toId().equals(kept.toId()) ? e.toId() : null;
         for (double[] p : samplePoly(poly, CORRIDOR_SAMPLE_STEP)) {

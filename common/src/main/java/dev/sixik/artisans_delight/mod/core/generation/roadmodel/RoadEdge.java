@@ -21,13 +21,30 @@ public final class RoadEdge {
     private final List<RoadPoint2D> geometry;
     private final boolean seaRoute;
     private final double distance;
+    /**
+     * Ребро запланировано топологией, но реальная дорога ещё не посчитана:
+     * геометрия — прямая хорда-заглушка. Дорогу досчитает
+     * {@code RoadStreamer}, когда игрок подойдёт ближе.
+     */
+    private final boolean pending;
 
     public RoadEdge(UUID fromId, UUID toId, List<RoadPoint2D> geometry, boolean seaRoute, double distance) {
+        this(fromId, toId, geometry, seaRoute, distance, false);
+    }
+
+    public RoadEdge(UUID fromId, UUID toId, List<RoadPoint2D> geometry, boolean seaRoute, double distance,
+                    boolean pending) {
         this.fromId = Objects.requireNonNull(fromId, "fromId");
         this.toId = Objects.requireNonNull(toId, "toId");
         this.geometry = geometry == null ? List.of() : List.copyOf(geometry);
         this.seaRoute = seaRoute;
         this.distance = distance;
+        this.pending = pending;
+    }
+
+    /** {@code true}, если дорога ещё не посчитана (геометрия — хорда-заглушка). */
+    public boolean pending() {
+        return pending;
     }
 
     public UUID fromId() {
