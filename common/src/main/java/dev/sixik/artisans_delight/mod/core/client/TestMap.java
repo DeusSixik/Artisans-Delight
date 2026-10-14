@@ -95,6 +95,11 @@ public class TestMap {
     // кратковременный плейсхолдер до завершения фоновой генерации.
     private static boolean showRoadPaths = true;
 
+    // Референсный зум маркеров: при нём пины имеют базовый размер (32x36).
+    // Совпадает с начальным зумом карты. При отдалении пины сжимаются
+    // (но не меньше minScreenSize), при приближении растут (не больше maxScreenSize).
+    private static final float KNOT_MARKER_REF_ZOOM = 0.35f;
+
     private static final MutableColor COLOR_WHITE = new MutableColor(1.0f, 1.0f, 1.0f, 1.0f);
     private static final TextureHandle ICON_NODE_TOWN = new MinecraftTextureHandle(
             ResourceLocation.fromNamespaceAndPath("artisans_delight", "textures/gui/icon_node_town.png"), 124, 140);
@@ -1731,6 +1736,11 @@ public class TestMap {
                 .screenSize(28.0f, 28.0f)
                 .pivot(0.5f, 0.5f)
                 .visibleZoomRange(0.85f, 10.0f)
+                // Домики видны только вблизи: скейл от зума с клампом,
+                // чтобы не раздувались на максимальном приближении.
+                .minScreenSize(14.0f, 14.0f)
+                .maxScreenSize(40.0f, 40.0f)
+                .zoomScaling(true, KNOT_MARKER_REF_ZOOM)
                 .visible(false);
 
                 house.anchor = houseAnchor;
@@ -1747,7 +1757,13 @@ public class TestMap {
         float pinH = 36.0f;
         canvas.anchorLayer().add("knot_" + knotId, worldX, worldY, marker)
                 .screenSize(pinW, pinH)
-                .pivot(0.5f, 1.0f);
+                .pivot(0.5f, 1.0f)
+                // Скейл от зума: на референсном зуме — базовый размер, при
+                // отдалении сжимается (не меньше 14x16), при приближении растёт
+                // (не больше 48x54). Без этого пины гигантские на дальнем зуме.
+                .minScreenSize(14.0f, 16.0f)
+                .maxScreenSize(48.0f, 54.0f)
+                .zoomScaling(true, KNOT_MARKER_REF_ZOOM);
 
         rootOverlay.addOverlay(tooltip);
         return true;

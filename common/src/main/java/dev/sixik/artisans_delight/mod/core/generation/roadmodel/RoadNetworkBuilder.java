@@ -103,6 +103,16 @@ public final class RoadNetworkBuilder {
     private static final double WAYPOINT_SEPARATION = 150.0;
     /** Отброс геометрии-детуров длиннее этого (эвклидово ребро короткое, а объезд — нет). */
     private static final double MAX_ROAD_LENGTH = LINK_RADIUS * 2.5;
+    /** Допуск почти-прямого пути: извилистость ниже — дорога идёт почти по хорде. */
+    private static final double STRAIGHT_TORTUOSITY = 1.08;
+    /** Предел извилистости: выше — петля/объезд, ребро отбрасывается. */
+    private static final double MAX_TORTUOSITY = 1.6;
+    /** Минимальный зазор между рёбрами — уже считается дублем/слипанием. */
+    private static final double CORRIDOR_MIN_GAP = 35.0;
+    /** Зазор слияния: дороги ближе — это одна дорога, дубликат выкидывается. */
+    private static final double CORRIDOR_MERGE_GAP = 90.0;
+    /** Доля длины для счёта параллельности (медиана по сэмплам). */
+    private static final double CORRIDOR_SAMPLE_STEP = 40.0;
 
     private RoadNetworkBuilder() {
     }
@@ -198,7 +208,26 @@ public final class RoadNetworkBuilder {
             Map<String, RoadEdge> edges = buildMeshEdgesParallel(
                 topoPairs, nodes, worldSeed, generator, height, randomState, calcPool);
 
+            // 3b. Деконфликтация по РЕАЛЬНОЙ геометрии: хорды топологии не видят
+            // кривизну дорог — две хорды расходятся, а полилинии по факту крестятся,
+            // идут дублями или петляют. Проверяем полилинии друг о друга: кресты,
+            // сближения и петли выкидываются до гарантии связности.
+            // Порядок детерминирован: сначала бывшие хорд-пересечения, потом короткие.
+            List<RoadEdge> geoList = new ArrayList<>(edges.values());
+            geoList.sort(Comparator.comparingDouble((RoadEdge e) -> chordLength(nodes, e))
+                .thenComparing(RoadEdge::key));
+            java.util.Set<String> dropped = deconflictGeometry(geoList);
+            for (String key : dropped) {
+                edges.remove(key);
+            }
+            if (!dropped.isEmpty()) {
+                LOGGER.info("[RoadNetworkBuilder] Деконфликтация геометрии: выкинуто {} рёбер (кресты/дубли/петли)",
+                    dropped.size());
+            }
+
             // 4. Финальная гарантия: топологическая связность + проверенная геометрия.
+            // Ремонт и сшивка тоже идут через геометрическую проверку: кандидат
+            // не должен креститься, дублировать или петлять относительно живых.
             ensureConnectivity(nodes, edges, townIds, worldSeed, generator, height, randomState);
 
             GenerationProgress.finish();
@@ -616,7 +645,7 @@ public final class RoadNetworkBuilder {
                 continue;
             }
             RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
-            if (edge != null) {
+            if (edge != null && !conflictsLiveGeometry(edge, liveEdges)) {
                 return edge;
             }
         }
@@ -679,7 +708,7 @@ public final class RoadNetworkBuilder {
                 continue;
             }
             RoadEdge edge = buildEdge(from, to, worldSeed, generator, height, randomState);
-            if (edge == null) {
+            if (edge == null || conflictsLiveGeometry(edge, liveEdges)) {
                 continue;
             }
             edges.put(edge.key(), edge);
@@ -731,6 +760,27 @@ public final class RoadNetworkBuilder {
             return new UUID[]{c.a(), c.b()};
         }
         return null;
+    }
+
+    /**
+     * Проверяет кандидата с готовой геометрией против живых рёбер: крест
+     * полилиний, дубль коридоров или петля у чужого узла — кандидат отклоняется.
+     * Общий узел — не конфликт (слияние в точке — норма, скрин 1 справа).
+     */
+    private static boolean conflictsLiveGeometry(RoadEdge edge, List<RoadEdge> liveEdges) {
+        List<double[]> poly = toPoly(edge);
+        for (RoadEdge k : liveEdges) {
+            if (edge.connects(k.fromId()) || edge.connects(k.toId())) {
+                if (loopsAtFreeEnd(poly, edge, k)) {
+                    return true;
+                }
+                continue;
+            }
+            if (polysCross(poly, toPoly(k)) || corridorsOverlap(poly, toPoly(k))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean crossesLive(UUID a,
@@ -836,8 +886,9 @@ public final class RoadNetworkBuilder {
 
     /**
      * Геометрия одного ребра меша. Возвращает {@code null}, если сухопутной
-     * дороги нет (океан/скалы) или объезд вышел слишком длинным — такое ребро
-     * отбрасывается, а не рисуется прямой через воду.
+     * дороги нет (океан/скалы), объезд вышел слишком длинным или путь
+     * петляет (извилистость выше предела) — такое ребро отбрасывается,
+     * а не рисуется прямой через воду или петлёй вокруг узла.
      */
     private static RoadEdge buildEdge(RoadNode from,
                                       RoadNode to,
@@ -864,6 +915,204 @@ public final class RoadNetworkBuilder {
         if (distance > MAX_ROAD_LENGTH) {
             return null;
         }
+        double chord = Math.hypot((double) from.x() - to.x(), (double) from.z() - to.z());
+        double tortuosity = chord > 1.0 ? distance / chord : 1.0;
+        if (tortuosity > MAX_TORTUOSITY) {
+            return null; // Петля/дикий объезд вместо дороги.
+        }
         return new RoadEdge(from.id(), to.id(), geometry, false, distance);
+    }
+
+    // =========================================================================
+    // Деконфликтация по реальной геометрии (кресты, дубли, петли)
+    // =========================================================================
+
+    /**
+     * Выкидывает рёбра, чья реальная геометрия конфликтует с уже принятыми.
+     *
+     * <p>Топология проверяет только прямые хорды, а дороги — кривые: пара хорд
+     * может расходиться, а полилинии при этом крестятся, слипаются в дубль или
+     * петляют. Каждое ребро (в порядке: сначала хорд-пересечения, потом короткие)
+     * проверяется против принятых: крест полилиний, сближение коридоров или
+     * петля вблизи чужого узла — повод выкинуть. Общий конец — не конфликт
+     * (слияние в узле — это хорошо, скрин 1 справа).
+     *
+     * @param ordered рёбра в порядке рассмотрения (мутируется только чтением)
+     * @return ключи выкинутых рёбер
+     */
+    private static java.util.Set<String> deconflictGeometry(List<RoadEdge> ordered) {
+        java.util.Set<String> dropped = new HashSet<>();
+        List<RoadEdge> kept = new ArrayList<>();
+        Map<String, List<double[]>> polyCache = new HashMap<>();
+        for (RoadEdge e : ordered) {
+            List<double[]> poly = polyCache.computeIfAbsent(e.key(), k -> toPoly(e));
+            boolean conflict = false;
+            for (RoadEdge k : kept) {
+                if (e.connects(k.fromId()) || e.connects(k.toId())) {
+                    // Общий узел: слияние дорог в точке — норма (скрин 1 справа).
+                    // Проверяем только петлю: заход чужой геометрии вплотную к
+                    // нашему свободному концу (скрин 1 слева).
+                    if (loopsAtFreeEnd(poly, e, k)) {
+                        conflict = true;
+                        break;
+                    }
+                    continue;
+                }
+                List<double[]> kPoly = polyCache.computeIfAbsent(k.key(), kk -> toPoly(k));
+                if (polysCross(poly, kPoly) || corridorsOverlap(poly, kPoly)) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if (conflict) {
+                dropped.add(e.key());
+            } else {
+                kept.add(e);
+            }
+        }
+        return dropped;
+    }
+
+    /** Длина прямой хорды ребра (для детерминированного порядка деконфликтации). */
+    private static double chordLength(Map<UUID, RoadNode> nodes, RoadEdge e) {
+        RoadNode a = nodes.get(e.fromId());
+        RoadNode b = nodes.get(e.toId());
+        if (a == null || b == null) {
+            return Double.MAX_VALUE;
+        }
+        return Math.hypot((double) a.x() - b.x(), (double) a.z() - b.z());
+    }
+
+    /** Полилиния ребра как пары double (кешируется на время деконфликтации). */
+    private static List<double[]> toPoly(RoadEdge e) {
+        List<double[]> poly = new ArrayList<>(e.geometry().size());
+        for (RoadPoint2D p : e.geometry()) {
+            poly.add(new double[]{p.x(), p.z()});
+        }
+        return poly;
+    }
+
+    /** Пересекаются ли полилинии (без учёта общих концов — их здесь нет). */
+    private static boolean polysCross(List<double[]> a, List<double[]> b) {
+        for (int i = 0; i < a.size() - 1; i++) {
+            double[] a1 = a.get(i);
+            double[] a2 = a.get(i + 1);
+            for (int j = 0; j < b.size() - 1; j++) {
+                double[] b1 = b.get(j);
+                double[] b2 = b.get(j + 1);
+                if (segmentsIntersect(a1[0], a1[1], a2[0], a2[1], b1[0], b1[1], b2[0], b2[1])) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Слипание коридоров: медианное расстояние между полилиниями меньше
+     * {@link #CORRIDOR_MERGE_GAP} — это дубль одной дороги (скрин 3),
+     * а не два независимых пути.
+     */
+    private static boolean corridorsOverlap(List<double[]> a, List<double[]> b) {
+        double med = medianMinDistance(a, b);
+        return med < CORRIDOR_MERGE_GAP;
+    }
+
+    /** Медиана минимальных расстояний от сэмплов A до полилинии B. */
+    private static double medianMinDistance(List<double[]> a, List<double[]> b) {
+        List<double[]> samples = samplePoly(a, CORRIDOR_SAMPLE_STEP);
+        if (samples.isEmpty()) {
+            return Double.MAX_VALUE;
+        }
+        double[] dists = new double[samples.size()];
+        for (int i = 0; i < samples.size(); i++) {
+            dists[i] = distToPoly(samples.get(i), b);
+        }
+        java.util.Arrays.sort(dists);
+        return dists[dists.length / 2];
+    }
+
+    /** Равномерные сэмплы вдоль полилинии с шагом (плюс концы). */
+    private static List<double[]> samplePoly(List<double[]> poly, double step) {
+        List<double[]> out = new ArrayList<>();
+        if (poly.isEmpty()) {
+            return out;
+        }
+        out.add(poly.get(0));
+        double acc = 0.0;
+        for (int i = 0; i < poly.size() - 1; i++) {
+            double[] p1 = poly.get(i);
+            double[] p2 = poly.get(i + 1);
+            double seg = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+            double t = step - acc;
+            while (t < seg) {
+                double f = t / seg;
+                out.add(new double[]{p1[0] + (p2[0] - p1[0]) * f, p1[1] + (p2[1] - p1[1]) * f});
+                t += step;
+            }
+            acc = (acc + seg) % step;
+        }
+        double[] last = poly.get(poly.size() - 1);
+        double[] prev = out.get(out.size() - 1);
+        if (Math.hypot(last[0] - prev[0], last[1] - prev[1]) > 1e-6) {
+            out.add(last);
+        }
+        return out;
+    }
+
+    /** Минимальное расстояние от точки до полилинии. */
+    private static double distToPoly(double[] p, List<double[]> poly) {
+        double best = Double.MAX_VALUE;
+        for (int i = 0; i < poly.size() - 1; i++) {
+            best = Math.min(best, distToSegment(p, poly.get(i), poly.get(i + 1)));
+        }
+        return best;
+    }
+
+    private static double distToSegment(double[] p, double[] a, double[] b) {
+        double dx = b[0] - a[0];
+        double dz = b[1] - a[1];
+        double len2 = dx * dx + dz * dz;
+        if (len2 < 1e-9) {
+            return Math.hypot(p[0] - a[0], p[1] - a[1]);
+        }
+        double t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dz) / len2;
+        t = Math.max(0.0, Math.min(1.0, t));
+        return Math.hypot(p[0] - (a[0] + dx * t), p[1] - (a[1] + dz * t));
+    }
+
+    /**
+     * Петля у чужого узла: геометрия ребра подходит вплотную
+     * ({@link #CORRIDOR_MIN_GAP}) к свободному концу соседа — узел петли
+     * (скрин 1 слева). Общий конец игнорируется: слияние в нём — норма.
+     */
+    private static boolean loopsAtFreeEnd(List<double[]> poly, RoadEdge e, RoadEdge kept) {
+        List<double[]> kPoly = toPoly(kept);
+        UUID sharedA = e.fromId().equals(kept.fromId()) || e.fromId().equals(kept.toId()) ? e.fromId() : null;
+        UUID sharedB = e.toId().equals(kept.fromId()) || e.toId().equals(kept.toId()) ? e.toId() : null;
+        for (double[] p : samplePoly(poly, CORRIDOR_SAMPLE_STEP)) {
+            for (double[] q : samplePoly(kPoly, CORRIDOR_SAMPLE_STEP)) {
+                double d = Math.hypot(p[0] - q[0], p[1] - q[1]);
+                if (d >= CORRIDOR_MIN_GAP) {
+                    continue;
+                }
+                boolean nearShared = (sharedA != null && nearEnd(q, kept, sharedA))
+                    || (sharedB != null && nearEnd(q, kept, sharedB));
+                if (!nearShared) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Лежит ли точка q вблизи конца ребра с id (в пределах зазора слияния). */
+    private static boolean nearEnd(double[] q, RoadEdge e, UUID endId) {
+        List<RoadPoint2D> g = e.geometry();
+        if (g.isEmpty()) {
+            return false;
+        }
+        RoadPoint2D end = e.fromId().equals(endId) ? g.get(0) : g.get(g.size() - 1);
+        return Math.hypot(q[0] - end.x(), q[1] - end.z()) < CORRIDOR_MERGE_GAP;
     }
 }
