@@ -873,55 +873,75 @@ public class TestMap {
                                 drawDashedLine(draw, x1, y1, x2, y2, seaColor, 2.5f, 8.0f, 5.0f);
                             }
                         } else {
-                            // Сухопутная дорога: полилиния по точкам (X, Z)
+                            // Сухопутная дорога: ленты RibbonMesh по точкам (X, Z).
+                            // Одна mesh-команда на ребро вместо N линий: miter-стыки,
+                            // круглые jointDots на A*-поворотах, ширина в мировых
+                            // единицах (честно сужается с зумом).
                             MutableColor roadGlow = new MutableColor(1.0f, 0.65f, 0.15f, 0.35f);
                             MutableColor roadColor = active
                                     ? new MutableColor(1.0f, 0.85f, 0.35f, 0.95f)
                                     : new MutableColor(0.60f, 0.55f, 0.45f, 0.70f);
 
+                            List<dev.sixik.unigui.api.render.DrawPoint> ribbonPts =
+                                    new ArrayList<>(pts.size());
+                            for (RoadPoint2D p : pts) {
+                                ribbonPts.add(new dev.sixik.unigui.api.render.DrawPoint(
+                                        world.worldToRootX((float) p.x()),
+                                        world.worldToRootY((float) p.z())));
+                            }
+                            dev.sixik.unigui.api.render.RibbonOptions roadOpts =
+                                    dev.sixik.unigui.api.render.RibbonOptions.defaults();
+
+                            // Мостовые сегменты — отдельными лентами (балка + настил),
+                            // сухопутные runs — общей лентой. Граница run определяется
+                            // по флагам isBridge концов сегмента, как раньше.
+                            // Run — полуинтервал точек [runStart, i): сегменты
+                            // [runStart, i-1]; замыкающая точка добавляется при смене
+                            // типа и в конце пути.
+                            int runStart = 0;
+                            boolean runIsBridge = pts.size() > 1
+                                    && pts.get(0).isBridge() && pts.get(1).isBridge();
+                            for (int i = 1; i < pts.size(); i++) {
+                                boolean segBridge = pts.get(i - 1).isBridge() && pts.get(i).isBridge();
+                                boolean last = i == pts.size() - 1;
+                                if (segBridge != runIsBridge || last) {
+                                    drawRoadRun(draw, ribbonPts, runStart, i + 1, runIsBridge, active,
+                                            roadGlow, roadColor, roadOpts);
+                                    runStart = i;
+                                    runIsBridge = segBridge;
+                                }
+                            }
+
+                            // Опоры моста по краям на берегу (screen-space круги)
                             for (int i = 0; i < pts.size() - 1; i++) {
-                                RoadPoint2D p1 = pts.get(i);
-                                RoadPoint2D p2 = pts.get(i + 1);
-                                float x1 = world.worldToRootX((float) p1.x());
-                                float y1 = world.worldToRootY((float) p1.z());
-                                float x2 = world.worldToRootX((float) p2.x());
-                                float y2 = world.worldToRootY((float) p2.z());
-
-                                boolean isBridge = p1.isBridge() && p2.isBridge();
-                                if (isBridge) {
-                                    // Опоры моста по краям на берегу
-                                    draw.addCircleFilled(x1, y1, 3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
-                                    draw.addCircleFilled(x2, y2, 3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
-
-                                    // Темная балка моста (подложка / перила)
-                                    draw.addLine(x1, y1, x2, y2, new MutableColor(0.24f, 0.16f, 0.10f, 0.95f), active ? 5.5f : 4.5f);
-                                    // Деревянный настил моста
-                                    MutableColor bridgeDeck = active
-                                            ? new MutableColor(1.0f, 0.85f, 0.45f, 1.0f)
-                                            : new MutableColor(0.88f, 0.68f, 0.42f, 0.95f);
-                                    draw.addLine(x1, y1, x2, y2, bridgeDeck, active ? 3.0f : 2.2f);
-                                } else {
-                                    if (active) {
-                                        draw.addLine(x1, y1, x2, y2, roadGlow, 5.5f);
-                                    }
-                                    draw.addLine(x1, y1, x2, y2, roadColor, active ? 3.0f : 2.0f);
+                                if (pts.get(i).isBridge() && pts.get(i + 1).isBridge()) {
+                                    draw.addCircleFilled(ribbonPts.get(i).x(), ribbonPts.get(i).y(),
+                                            3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
+                                    draw.addCircleFilled(ribbonPts.get(i + 1).x(), ribbonPts.get(i + 1).y(),
+                                            3.2f, new MutableColor(0.28f, 0.20f, 0.14f, 1.0f), 8);
                                 }
                             }
                         }
                     } else {
-                        // Логическая сеть узлов: прямая связь
+                        // Логическая сеть узлов: прямая связь лентами
                         float x1 = world.worldToRootX((float) fromNode.x());
                         float y1 = world.worldToRootY((float) fromNode.z());
                         float x2 = world.worldToRootX((float) toNode.x());
                         float y2 = world.worldToRootY((float) toNode.z());
+                        List<dev.sixik.unigui.api.render.DrawPoint> linkPts = List.of(
+                                new dev.sixik.unigui.api.render.DrawPoint(x1, y1),
+                                new dev.sixik.unigui.api.render.DrawPoint(x2, y2));
 
                         if (active) {
-                            // Светящийся торговый путь
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.85f, 0.35f, 0.95f), 3.5f);
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(1.0f, 0.65f, 0.15f, 0.40f), 6.5f);
+                            // Светящийся торговый путь: широкая глоу-лента + узкое ядро
+                            draw.ribbon(null, linkPts, 12.0f, 32.0f,
+                                    new MutableColor(1.0f, 0.65f, 0.15f, 0.40f));
+                            draw.ribbon(null, linkPts, 6.5f, 32.0f,
+                                    new MutableColor(1.0f, 0.85f, 0.35f, 0.95f));
                         } else {
                             // Неактивная дорога
-                            draw.addLine(x1, y1, x2, y2, new MutableColor(0.40f, 0.52f, 0.68f, 0.60f), 2.0f);
+                            draw.ribbon(null, linkPts, 4.0f, 32.0f,
+                                    new MutableColor(0.40f, 0.52f, 0.68f, 0.60f));
                         }
                     }
                 }
@@ -2080,6 +2100,36 @@ public class TestMap {
             }
             traveled = next;
             drawDash = !drawDash;
+        }
+    }
+
+    /**
+     * Отрисовка однородного отрезка дороги ([from, to) в screen-space точках) лентами.
+     *
+     * <p>Мост: широкая тёмная балка + узкий деревянный настил. Суша: глоу-подложка
+     * для активных + тело дороги. Ширины — screen-space пиксели ленты: при текущем
+     * зуме совпадают со старыми толщинами линий, miter и jointDots закрывают стыки.
+     */
+    private static void drawRoadRun(DrawScope draw,
+                                    List<dev.sixik.unigui.api.render.DrawPoint> pts,
+                                    int from, int to,
+                                    boolean isBridge, boolean active,
+                                    MutableColor roadGlow, MutableColor roadColor,
+                                    dev.sixik.unigui.api.render.RibbonOptions opts) {
+        if (to - from < 2) return;
+        List<dev.sixik.unigui.api.render.DrawPoint> run = pts.subList(from, to);
+        if (isBridge) {
+            draw.ribbon(null, run, active ? 5.0f : 4.5f, 32.0f,
+                    new MutableColor(0.24f, 0.16f, 0.10f, 0.95f), opts);
+            MutableColor deck = active
+                    ? new MutableColor(1.0f, 0.85f, 0.45f, 1.0f)
+                    : new MutableColor(0.88f, 0.68f, 0.42f, 0.95f);
+            draw.ribbon(null, run, active ? 2.8f : 2.2f, 32.0f, deck, opts);
+        } else {
+            if (active) {
+                draw.ribbon(null, run, 5.0f, 32.0f, roadGlow, opts);
+            }
+            draw.ribbon(null, run, active ? 2.8f : 2.0f, 32.0f, roadColor, opts);
         }
     }
 
