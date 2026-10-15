@@ -83,15 +83,28 @@ public final class ServerNetworkInitializer {
      * Перед расчётом новой сети вызывать {@link RoadStreamer#stopActive()},
      * чтобы старый стример не перезаписал свежую публикацию.
      */
-    private static void publishAndStream(ServerLevel level, RoadNetwork network) {
+    private static void publishAndStream(ServerLevel level, RoadNetwork network, long worldSeed) {
         if (RoadNetworkBuilder.geometryMode() == RoadNetworkBuilder.GeometryMode.STREAM) {
-            // Стример сам публикует каркас, уже наложив дороги из кэша сессии:
+            // Стример сам публикует каркас, уже наложив дороги из кэша:
             // при пересборке посчитанные дороги не пропадают ни на кадр.
             RoadStreamer.start(level, network);
         } else {
             RoadStreamer.stopActive();
             RoadNetworkStore.publish(network);
         }
+        // Поле и проверки воды посчитаны при сборке — сохраняем сразу.
+        RoadPersistence.saveIfDirty(level, worldSeed);
+    }
+
+    /**
+     * Перед расчётом сети: останавливает старый стример (чтобы он не перезаписал
+     * свежую публикацию) и загружает кэш/закрепления этого мира с диска.
+     */
+    private static void prepareBuild(ServerLevel level, long worldSeed) {
+        RoadStreamer.stopActive();
+        RoadPersistence.ensureLoaded(level, worldSeed);
+        // Слой объездов препятствий обслуживает сеть этого мира.
+        RouteDetourEngine.bind(level);
     }
     
     /**
@@ -158,11 +171,11 @@ public final class ServerNetworkInitializer {
                     LOGGER.info("[ServerNetworkInitializer] Запускаю виртуальный расчёт дорожной сети ({} городов)...", townSeeds.size());
                     long netStartTime = System.currentTimeMillis();
 
-                    RoadStreamer.stopActive();
+                    prepareBuild(level, worldSeed);
                     RoadNetwork network = RoadNetworkBuilder.build(
                         townSeeds, worldSeed, generator, level, randomState
                     );
-                    publishAndStream(level, network);
+                    publishAndStream(level, network, worldSeed);
 
                     long netTime = System.currentTimeMillis() - netStartTime;
                     long totalTime = System.currentTimeMillis() - startTime;
@@ -249,11 +262,11 @@ public final class ServerNetworkInitializer {
 
                     // Пересобираем TownSeed с реальным сидом (id должны быть детерминированы)
                     townSeeds = collectTownSeeds(manager, worldSeed);
-                    RoadStreamer.stopActive();
+                    prepareBuild(level, worldSeed);
                     RoadNetwork network = RoadNetworkBuilder.build(
                         townSeeds, worldSeed, generator, level, randomState
                     );
-                    publishAndStream(level, network);
+                    publishAndStream(level, network, worldSeed);
 
                     LAST_REBUILD_TOWN_COUNT.put(dimensionKey, townCount);
                     GenerationProgress.finish();
@@ -300,9 +313,9 @@ public final class ServerNetworkInitializer {
                     center == null ? BlockPos.ZERO : center, 3500);
                 List<RoadNetworkBuilder.TownSeed> seeds = collectTownSeeds(manager, worldSeed);
                 long t0 = System.currentTimeMillis();
-                RoadStreamer.stopActive();
+                prepareBuild(level, worldSeed);
                 RoadNetwork network = RoadNetworkBuilder.build(seeds, worldSeed, generator, level, randomState);
-                publishAndStream(level, network);
+                publishAndStream(level, network, worldSeed);
                 manager.markNetworkInitialized();
                 LOGGER.info("[ServerNetworkInitializer] Принудительная пересборка ({}, геометрия {}) за {} мс: {} узлов, {} рёбер",
                     RoadNetworkBuilder.topologyMode(), RoadNetworkBuilder.geometryMode(),

@@ -556,6 +556,94 @@ public class TestMap {
                     return true;
                 }
 
+                // 1a. Ctrl + P (дебаг): вкл/выкл доукладку дорог в уже
+                // сгенерированные чанки (укладка при генерации работает всегда).
+                if (keyCode == GLFW.GLFW_KEY_P && Screen.hasControlDown()) {
+                    boolean on = !dev.sixik.artisans_delight.mod.core.generation.path.RoadPaver.retroPavingEnabled();
+                    dev.sixik.artisans_delight.mod.core.generation.path.RoadPaver.retroPavingEnabled(on);
+                    if (activeStatus != null) {
+                        activeStatus.text("[DEBUG] Доукладка в сгенерированные чанки: " + (on ? "ВКЛ" : "ВЫКЛ"));
+                    }
+                    return true;
+                }
+
+                // 1c. Ctrl + B (дебаг): препятствие радиусом 24 под игроком
+                // (BLOCKING); Ctrl + Shift + B — снять ближайшее в радиусе 128.
+                if (keyCode == GLFW.GLFW_KEY_B && Screen.hasControlDown()
+                        && minecraft.getSingleplayerServer() != null && minecraft.level != null
+                        && minecraft.player != null) {
+                    ServerLevel sl = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                    BlockPos at = minecraft.player.blockPosition();
+                    if (sl != null) {
+                        if (Screen.hasShiftDown()) {
+                            dev.sixik.artisans_delight.mod.core.generation.path.RoadObstacle nearest = null;
+                            double best = 128.0 * 128.0;
+                            for (var o : dev.sixik.artisans_delight.mod.api.RoadEventsApi.getObstacles(sl)) {
+                                double d = o.center().distSqr(at);
+                                if (d < best) {
+                                    best = d;
+                                    nearest = o;
+                                }
+                            }
+                            if (nearest != null) {
+                                final var rid = nearest.id();
+                                minecraft.getSingleplayerServer().execute(() ->
+                                        dev.sixik.artisans_delight.mod.api.RoadEventsApi.removeObstacle(sl, rid));
+                            }
+                            if (activeStatus != null) {
+                                activeStatus.text(nearest != null
+                                        ? "[DEBUG] Препятствие снято: " + nearest.id()
+                                        : "[DEBUG] Рядом нет препятствий");
+                            }
+                        } else {
+                            var obstacle = new dev.sixik.artisans_delight.mod.core.generation.path.RoadObstacle(
+                                    ResourceLocation.fromNamespaceAndPath("artisans_delight",
+                                            "debug_" + at.getX() + "_" + at.getZ()),
+                                    at, 24.0,
+                                    dev.sixik.artisans_delight.mod.core.generation.path.RoadObstacle.ObstacleSeverity.BLOCKING);
+                            minecraft.getSingleplayerServer().execute(() -> {
+                                int n = dev.sixik.artisans_delight.mod.api.RoadEventsApi.registerObstacle(sl, obstacle);
+                                minecraft.execute(() -> {
+                                    if (activeStatus != null) {
+                                        activeStatus.text("[DEBUG] Препятствие поставлено, задето дорог: " + n);
+                                    }
+                                });
+                            });
+                        }
+                    }
+                    return true;
+                }
+
+                // 1b. Ctrl + K (дебаг): закрепить готовые дороги в радиусе 400 блоков
+                // от игрока — имитация укладки в мир, пока шаг укладки не готов.
+                // Закреплённые дороги переживают пересборку и перезапуск мира.
+                if (keyCode == GLFW.GLFW_KEY_K && Screen.hasControlDown()) {
+                    var net = dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkStore.current();
+                    int committed = 0;
+                    if (net != null && minecraft.player != null) {
+                        double px = minecraft.player.getX();
+                        double pz = minecraft.player.getZ();
+                        for (var e : net.edges()) {
+                            if (e.pending()) continue;
+                            var a = net.node(e.fromId());
+                            var b = net.node(e.toId());
+                            if (a == null || b == null) continue;
+                            double mx = (a.x() + b.x()) * 0.5 - px;
+                            double mz = (a.z() + b.z()) * 0.5 - pz;
+                            if (mx * mx + mz * mz > 400.0 * 400.0) continue;
+                            var baseEdge = dev.sixik.artisans_delight.mod.core.generation.path.RouteDetourEngine.baselineOf(e);
+                            if (dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadCommitStore.commit(baseEdge, a, b)) {
+                                committed++;
+                            }
+                        }
+                    }
+                    if (activeStatus != null) {
+                        activeStatus.text("[DEBUG] Закреплено дорог: " + committed + " (всего "
+                                + dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadCommitStore.size() + ")");
+                    }
+                    return true;
+                }
+
                 // 2. Дебаг виртуальной сети (в мир ничего не пишется, расчёт в фоне):
                 //    Ctrl+R — пересчитать;
                 //    Ctrl+T — переключить топологию RNG ↔ GREEDY и пересчитать;
@@ -921,6 +1009,11 @@ public class TestMap {
                             MutableColor roadColor = active
                                     ? new MutableColor(1.0f, 0.85f, 0.35f, 0.95f)
                                     : new MutableColor(0.60f, 0.55f, 0.45f, 0.70f);
+                            if (!active && dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadCommitStore
+                                    .isCommitted(edge.key())) {
+                                // Закреплённая (уложенная в мир) дорога — насыщенный коричневый
+                                roadColor = new MutableColor(0.80f, 0.45f, 0.20f, 0.95f);
+                            }
 
                             List<dev.sixik.unigui.api.render.DrawPoint> ribbonPts =
                                     new ArrayList<>(pts.size());
@@ -1056,6 +1149,26 @@ public class TestMap {
                     MutableColor haloColor = new MutableColor(0.35f, 0.80f, 0.45f, 0.55f);
                     draw.addCircleFilled(kx, ky, 4.0f, haloColor, 12);
                     draw.addCircle(kx, ky, 6.0f, new MutableColor(1.0f, 1.0f, 1.0f, 0.40f), 12, 1.0f);
+                }
+            }
+
+            // === 6c. ПРЕПЯТСТВИЯ НА ДОРОГАХ (RoadEventsApi) ===
+            if (minecraft.getSingleplayerServer() != null && minecraft.level != null) {
+                ServerLevel obsLevel = minecraft.getSingleplayerServer().getLevel(minecraft.level.dimension());
+                if (obsLevel != null) {
+                    for (var o : dev.sixik.artisans_delight.mod.api.RoadEventsApi.getObstacles(obsLevel)) {
+                        float ox = world.worldToRootX((float) o.center().getX());
+                        float oy = world.worldToRootY((float) o.center().getZ());
+                        float or = (float) o.radius() * world.viewport().zoom();
+                        boolean blocking = o.severity()
+                                == dev.sixik.artisans_delight.mod.core.generation.path.RoadObstacle.ObstacleSeverity.BLOCKING;
+                        MutableColor edgeCol = blocking
+                                ? new MutableColor(0.95f, 0.20f, 0.20f, 0.90f)
+                                : new MutableColor(0.95f, 0.65f, 0.15f, 0.90f);
+                        draw.addCircleFilled(ox, oy, Math.max(or, 4.0f),
+                                new MutableColor(edgeCol.r(), edgeCol.g(), edgeCol.b(), 0.18f), 32);
+                        draw.addCircle(ox, oy, Math.max(or, 4.0f), edgeCol, 32, 2.0f);
+                    }
                 }
             }
 

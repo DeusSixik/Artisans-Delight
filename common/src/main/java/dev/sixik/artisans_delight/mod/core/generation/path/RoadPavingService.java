@@ -36,13 +36,11 @@ public final class RoadPavingService {
     /**
      * Главный выключатель мощения дорог в мире.
      *
-     * <p>Сейчас сеть считается ВИРТУАЛЬНО (см. {@code roadmodel}): узлы и дороги
-     * существуют только как расчёт для карты, в мир ничего не пишется.
-     * Мощение чанков (единственное место, ставящее блоки) отключено, пока не будет
-     * готова нормальная система интеграции (NetworkApplier).
-     * Чтобы вернуть мощение: {@code PAVING_ENABLED = true}.
+     * <p>Укладка при генерации чанков идёт по виртуальной сети
+     * ({@code RoadNetworkStore}) через {@link RoadPaver}; доукладка в уже
+     * сгенерированные чанки — отдельным флагом {@link RoadPaver#retroPavingEnabled()}.
      */
-    public static final boolean PAVING_ENABLED = false;
+    public static final boolean PAVING_ENABLED = true;
 
     public enum PavingTier {
         TRAIL,    // Грунтовая тропа: расчистка травы, грязь / dirt_path
@@ -207,103 +205,11 @@ public final class RoadPavingService {
     public static void paveChunk(WorldGenLevel level, ChunkAccess chunk) {
         if (!PAVING_ENABLED) return;
         if (level == null || chunk == null) return;
-
-        WorldObjectManager manager;
         try {
-            manager = WorldObjectManagerApi.getManager(level.getLevel());
+            RoadPaver.paveWorldgen(level, chunk);
         } catch (Throwable t) {
-            return;
-        }
-
-        if (manager == null) return;
-
-        ChunkPos cPos = chunk.getPos();
-        int chunkMinX = cPos.getMinBlockX();
-        int chunkMaxX = cPos.getMaxBlockX();
-        int chunkMinZ = cPos.getMinBlockZ();
-        int chunkMaxZ = cPos.getMaxBlockZ();
-
-        Collection<WorldObject> knots = manager.all();
-        if (knots.isEmpty()) return;
-
-        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
-
-        for (WorldObject knot : knots) {
-            KnotRoutesComponent routes = knot.getSingle(KnotRoutesComponent.class).orElse(null);
-            if (routes == null) continue;
-
-            for (KnotRouteEntry route : routes.routes.get()) {
-                if (route.isSeaRoute() || route.waypoints().size() < 2) continue;
-
-                ObjectList<RoadPoint2D> pts = route.waypoints();
-
-                for (int i = 0; i < pts.size() - 1; i++) {
-                    RoadPoint2D p1 = pts.get(i);
-                    RoadPoint2D p2 = pts.get(i + 1);
-
-                    // Быстрая проверка AABB отрезка против границ чанка (с запасом 3 блока)
-                    int segMinX = Math.min(p1.x(), p2.x()) - 3;
-                    int segMaxX = Math.max(p1.x(), p2.x()) + 3;
-                    int segMinZ = Math.min(p1.z(), p2.z()) - 3;
-                    int segMaxZ = Math.max(p1.z(), p2.z()) + 3;
-
-                    if (segMaxX < chunkMinX || segMinX > chunkMaxX || segMaxZ < chunkMinZ || segMinZ > chunkMaxZ) {
-                        continue;
-                    }
-
-                    // Шагаем вдоль отрезка с интервалом ~1.5 блока
-                    double dx = p2.x() - p1.x();
-                    double dz = p2.z() - p1.z();
-                    double len = Math.hypot(dx, dz);
-                    if (len <= 0.01) continue;
-
-                    int steps = (int) Math.ceil(len / 1.5);
-                    boolean isBridge = p1.isBridge() && p2.isBridge();
-
-                    for (int s = 0; s <= steps; s++) {
-                        double t = (double) s / steps;
-                        int cx = (int) Math.round(p1.x() + t * dx);
-                        int cz = (int) Math.round(p1.z() + t * dz);
-
-                        // Проверяем ширину 1.5 блока в обе стороны (перпендикуляр)
-                        for (int ox = -1; ox <= 1; ox++) {
-                            for (int oz = -1; oz <= 1; oz++) {
-                                int bx = cx + ox;
-                                int bz = cz + oz;
-
-                                if (bx < chunkMinX || bx > chunkMaxX || bz < chunkMinZ || bz > chunkMaxZ) {
-                                    continue;
-                                }
-
-                                int localX = bx & 15;
-                                int localZ = bz & 15;
-                                int surfaceY = chunk.getHeight(Heightmap.Types.WORLD_SURFACE_WG, localX, localZ);
-
-                                cursor.set(bx, surfaceY, bz);
-                                BlockState above = chunk.getBlockState(cursor);
-                                if (above.canBeReplaced() && !above.is(Blocks.WATER)) {
-                                    chunk.setBlockState(cursor, Blocks.AIR.defaultBlockState(), false);
-                                }
-
-                                cursor.set(bx, surfaceY - 1, bz);
-                                BlockState surf = chunk.getBlockState(cursor);
-
-                                if (isBridge) {
-                                    // Мостки над водой
-                                    if (surf.is(Blocks.WATER) || surfaceY <= 63) {
-                                        cursor.set(bx, 64, bz);
-                                        chunk.setBlockState(cursor, Blocks.OAK_PLANKS.defaultBlockState(), false);
-                                    }
-                                } else {
-                                    if (surf.is(Blocks.GRASS_BLOCK) || surf.is(Blocks.DIRT) || surf.is(Blocks.PODZOL)) {
-                                        chunk.setBlockState(cursor, Blocks.DIRT_PATH.defaultBlockState(), false);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Генерация мира не должна падать из-за дорог.
+            LOGGER.warn("[RoadPavingService] Ошибка укладки чанка {}: {}", chunk.getPos(), t.toString());
         }
     }
 

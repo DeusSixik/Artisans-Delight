@@ -243,7 +243,8 @@ public final class RoadNetworkBuilder {
                                     LevelHeightAccessor height,
                                     RandomState randomState) {
         GenerationProgress.begin();
-        RoadCalcCache.ensureSeed(worldSeed);
+        // Область кэша (сид + измерение) и загрузку с диска задаёт вызывающий
+        // код через RoadPersistence.ensureLoaded до вызова build().
 
         List<TownSeed> townList = towns == null ? List.of() : new ArrayList<>(towns);
         if (townList.size() < 2) {
@@ -302,6 +303,18 @@ public final class RoadNetworkBuilder {
             LOGGER.info("[RoadNetworkBuilder] Поле меша: {} перекрёстков (шаг {}, ядро+ореол {}) за {} мс",
                 field.size(), FIELD_STEP, halo, tField - tStart);
 
+            // 1b. Закреплённые рёбра (уже уложены в мир) — неизменны. Их концы
+            // возвращаются в сеть, даже если поле их больше не даёт (например,
+            // перекрёсток подавлен новой деревней). Город, который есть в живом
+            // списке, не перезаписывается: у живого актуальный sourceId.
+            CommittedIndex committedIdx = CommittedIndex.snapshot();
+            Map<String, RoadEdge> committedEdges = new LinkedHashMap<>();
+            for (RoadCommitStore.Committed c : committedIdx.entries()) {
+                nodes.putIfAbsent(c.a().id(), c.a());
+                nodes.putIfAbsent(c.b().id(), c.b());
+                committedEdges.put(c.edge().key(), c.edge());
+            }
+
             // 2. Топология узел–узел.
             Set<UUID> townIds = new HashSet<>();
             for (TownSeed t : townList) {
@@ -313,17 +326,35 @@ public final class RoadNetworkBuilder {
 
             // 2b. Обрезка по ядру: ребро наше, если хоть один конец в ядре.
             // Узлы ореола остаются, только если на них опирается такое ребро.
+            // Закреплённые рёбра идут отдельно; новые, чья хорда пересекает
+            // закреплённую дорогу, отбрасываются.
             List<UUID[]> topoPairs = new ArrayList<>(allPairs.size());
             Set<UUID> referenced = new HashSet<>();
+            for (RoadEdge ce : committedEdges.values()) {
+                referenced.add(ce.fromId());
+                referenced.add(ce.toId());
+            }
+            int crossCommitted = 0;
             for (UUID[] pair : allPairs) {
                 RoadNode a = nodes.get(pair[0]);
                 RoadNode b = nodes.get(pair[1]);
+                if (committedEdges.containsKey(edgeKey(pair[0], pair[1]))) {
+                    continue;
+                }
                 if (inRect(a, coreMinX, coreMinZ, coreMaxX, coreMaxZ)
                     || inRect(b, coreMinX, coreMinZ, coreMaxX, coreMaxZ)) {
+                    if (committedIdx.size() > 0 && committedIdx.crosses(straightEdge(a, b))) {
+                        crossCommitted++;
+                        continue;
+                    }
                     topoPairs.add(pair);
                     referenced.add(pair[0]);
                     referenced.add(pair[1]);
                 }
+            }
+            if (committedIdx.size() > 0) {
+                LOGGER.info("[RoadNetworkBuilder] Закреплённых рёбер: {}, отброшено новых, пересекающих их: {}",
+                    committedIdx.size(), crossCommitted);
             }
             nodes.values().removeIf(n -> !n.isTown()
                 && !inRect(n, coreMinX, coreMinZ, coreMaxX, coreMaxZ)
@@ -342,6 +373,10 @@ public final class RoadNetworkBuilder {
                 stillReferenced.add(pair[0]);
                 stillReferenced.add(pair[1]);
             }
+            for (RoadEdge ce : committedEdges.values()) {
+                stillReferenced.add(ce.fromId());
+                stillReferenced.add(ce.toId());
+            }
             int before = nodes.size();
             nodes.values().removeIf(n -> !n.isTown() && !stillReferenced.contains(n.id()));
             long tSea = System.currentTimeMillis();
@@ -351,7 +386,8 @@ public final class RoadNetworkBuilder {
             // 2d. Потоковый режим: узлы + ожидающие рёбра (хорды-заглушки).
             // Реальные дороги досчитает RoadStreamer по мере приближения игрока.
             if (preview) {
-                Map<String, RoadEdge> pendingEdges = new LinkedHashMap<>();
+                // Закреплённые — первыми и с реальной геометрией.
+                Map<String, RoadEdge> pendingEdges = new LinkedHashMap<>(committedEdges);
                 for (UUID[] pair : topoPairs) {
                     RoadEdge e = straightEdge(nodes.get(pair[0]), nodes.get(pair[1]));
                     pendingEdges.put(e.key(), e);
@@ -381,6 +417,9 @@ public final class RoadNetworkBuilder {
             for (String key : dropped) {
                 edges.remove(key);
             }
+            // Старый режим «вся карта»: закреплённые рёбра просто добавляются
+            // поверх (их пересечения с новыми здесь не разрешаются).
+            edges.putAll(committedEdges);
             if (!dropped.isEmpty()) {
                 LOGGER.info("[RoadNetworkBuilder] Деконфликтация геометрии: выкинуто {} рёбер (кресты/дубли/петли)",
                     dropped.size());
@@ -586,6 +625,70 @@ public final class RoadNetworkBuilder {
 
     private static boolean inRect(RoadNode n, int minX, int minZ, int maxX, int maxZ) {
         return n != null && n.x() >= minX && n.x() <= maxX && n.z() >= minZ && n.z() <= maxZ;
+    }
+
+    /** Канонический ключ ребра (как {@link RoadEdge#key()}), без создания ребра. */
+    private static String edgeKey(UUID a, UUID b) {
+        return a.compareTo(b) < 0 ? a + "_" + b : b + "_" + a;
+    }
+
+    /**
+     * Снимок закреплённых рёбер с предрасчитанными полилиниями и bbox —
+     * для быстрой проверки «новое ребро пересекает уложенную дорогу».
+     */
+    public static final class CommittedIndex {
+        private final List<RoadCommitStore.Committed> entries;
+        private final List<List<double[]>> polys;
+        private final List<double[]> boxes;
+
+        private CommittedIndex(List<RoadCommitStore.Committed> entries) {
+            this.entries = entries;
+            this.polys = new ArrayList<>(entries.size());
+            this.boxes = new ArrayList<>(entries.size());
+            for (RoadCommitStore.Committed c : entries) {
+                List<double[]> poly = toPoly(c.edge());
+                polys.add(poly);
+                boxes.add(polyBbox(poly));
+            }
+        }
+
+        /** Снимок текущего {@link RoadCommitStore}. */
+        public static CommittedIndex snapshot() {
+            return new CommittedIndex(RoadCommitStore.all());
+        }
+
+        public List<RoadCommitStore.Committed> entries() {
+            return entries;
+        }
+
+        public int size() {
+            return entries.size();
+        }
+
+        /**
+         * Пересекает ли геометрия ребра хоть одну закреплённую дорогу.
+         * Закреплённые рёбра с общим узлом не считаются: слияние в узле — норма.
+         */
+        public boolean crosses(RoadEdge e) {
+            if (entries.isEmpty()) {
+                return false;
+            }
+            List<double[]> poly = toPoly(e);
+            double[] box = polyBbox(poly);
+            for (int i = 0; i < entries.size(); i++) {
+                RoadEdge c = entries.get(i).edge();
+                if (c.key().equals(e.key()) || e.connects(c.fromId()) || e.connects(c.toId())) {
+                    continue;
+                }
+                if (!boxesOverlap(box, boxes.get(i), 0.0)) {
+                    continue;
+                }
+                if (polysCross(poly, polys.get(i))) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     /** Ожидающее ребро: прямая хорда-заглушка до расчёта реальной дороги. */

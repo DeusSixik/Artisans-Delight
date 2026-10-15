@@ -1,6 +1,7 @@
 package dev.sixik.artisans_delight.mod.core.generation.path;
 
 import dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadCalcCache;
+import dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadCommitStore;
 import dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadEdge;
 import dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetwork;
 import dev.sixik.artisans_delight.mod.core.generation.roadmodel.RoadNetworkBuilder;
@@ -65,6 +66,8 @@ public final class RoadStreamer {
     private static final int THREADS = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors() - 1));
     /** Максимум рёбер в работе одновременно (очередь не раздувается). */
     private static final int MAX_IN_FLIGHT = THREADS * 2;
+    /** Как часто (в тиках планировщика) сохранять кэш на диск, если он изменился. */
+    private static final int SAVE_EVERY_TICKS = 30;
 
     private static final AtomicReference<RoadStreamer> ACTIVE = new AtomicReference<>();
 
@@ -84,6 +87,12 @@ public final class RoadStreamer {
     private final AtomicInteger failedCount = new AtomicInteger();
     private volatile double[][] players = new double[0][];
     private volatile boolean stopped;
+    /** Снимок закреплённых рёбер; обновляется, когда их число меняется. */
+    private volatile RoadNetworkBuilder.CommittedIndex committedIdx = RoadNetworkBuilder.CommittedIndex.snapshot();
+    private final AtomicInteger crossedCount = new AtomicInteger();
+    /** Проход доукладки уже стоит в очереди серверного потока. */
+    private final AtomicBoolean retroQueued = new AtomicBoolean(false);
+    private int tickCounter;
 
     private final ScheduledExecutorService scheduler;
     private final ExecutorService pool;
@@ -98,7 +107,6 @@ public final class RoadStreamer {
             nodes.put(n.id(), n);
         }
         this.edgeOrder = new ArrayList<>(base.edgeCount());
-        RoadCalcCache.ensureSeed(worldSeed);
         for (RoadEdge e : base.edges()) {
             edgeOrder.add(e.key());
             if (!e.pending()) {
@@ -113,7 +121,9 @@ public final class RoadStreamer {
             RoadCalcCache.Hit hit = (a == null || b == null)
                 ? RoadCalcCache.Hit.MISS
                 : RoadCalcCache.lookupGeometry(e.key(), a, b);
-            if (hit == RoadCalcCache.Hit.READY) {
+            if (hit == RoadCalcCache.Hit.READY && committedIdx.crosses(RoadCalcCache.cachedEdge(e.key()))) {
+                crossedCount.incrementAndGet(); // кривая пересекает уложенную дорогу
+            } else if (hit == RoadCalcCache.Hit.READY) {
                 edges.put(e.key(), RoadCalcCache.cachedEdge(e.key()));
                 readyCount.incrementAndGet();
             } else if (hit == RoadCalcCache.Hit.FAILED) {
@@ -195,7 +205,8 @@ public final class RoadStreamer {
         try {
             MinecraftServer server = level.getServer();
             if (server == null || !server.isRunning() || server.getLevel(level.dimension()) != level) {
-                LOGGER.info("[RoadStreamer] Мир выгружен — остановка");
+                LOGGER.info("[RoadStreamer] Мир выгружен — сохранение и остановка");
+                RoadPersistence.saveIfDirty(level, worldSeed);
                 ACTIVE.compareAndSet(this, null);
                 stop();
                 return;
@@ -204,8 +215,31 @@ public final class RoadStreamer {
             // прошлого тика (задержка ≤ 1 с несущественна).
             server.execute(this::capturePlayers);
 
+            // Доукладка дорог в уже загруженные чанки — тоже на серверном потоке
+            // (setBlock). Не больше одного прохода в очереди.
+            if (RoadPaver.retroPavingEnabled() && retroQueued.compareAndSet(false, true)) {
+                double[][] ps = players;
+                server.execute(() -> {
+                    try {
+                        RoadPaver.retroPass(level, worldSeed, ps);
+                    } catch (Throwable t) {
+                        LOGGER.warn("[RoadStreamer] Ошибка доукладки: {}", t.toString());
+                    } finally {
+                        retroQueued.set(false);
+                    }
+                });
+            }
+
+            if (RoadCommitStore.size() != committedIdx.size()) {
+                committedIdx = RoadNetworkBuilder.CommittedIndex.snapshot();
+            }
             if (dirty.getAndSet(false)) {
                 publish();
+            }
+            // Закрепления пишем сразу (это уложенные блоки), кэш — раз в N тиков.
+            tickCounter++;
+            if (RoadPersistence.hasUnsavedCommits() || tickCounter % SAVE_EVERY_TICKS == 0) {
+                RoadPersistence.saveIfDirty(level, worldSeed);
             }
             schedule(players);
         } catch (Throwable t) {
@@ -279,7 +313,14 @@ public final class RoadStreamer {
             if (stopped) {
                 return;
             }
-            if (real != null) {
+            if (real != null && committedIdx.crosses(real)) {
+                // Хорда обошла закреплённую дорогу, а реальная кривая её
+                // пересекает. Уложенные блоки важнее — новое ребро убираем.
+                // В кэше A* остаётся честный результат (он не зависит от
+                // закреплений), решение принимается здесь.
+                edges.remove(key);
+                crossedCount.incrementAndGet();
+            } else if (real != null) {
                 edges.put(key, real);
                 readyCount.incrementAndGet();
             } else {
@@ -329,8 +370,8 @@ public final class RoadStreamer {
             }
         }
         RoadNetworkStore.publish(new RoadNetwork(worldSeed, snapNodes, snapEdges));
-        LOGGER.info("[RoadStreamer] Опубликовано: дорог {}, ждут {}, в работе {}, провал {}, узлов {}",
-            readyCount.get(), pending, inFlight.size(), failedCount.get(), snapNodes.size());
+        LOGGER.info("[RoadStreamer] Опубликовано: дорог {}, ждут {}, в работе {}, провал {}, пересекли закреплённые {}, узлов {}",
+            readyCount.get(), pending, inFlight.size(), failedCount.get(), crossedCount.get(), snapNodes.size());
     }
 
     // =========================================================================
